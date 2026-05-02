@@ -49,6 +49,62 @@ depth:
   alpha: 1200.0
   beta:  -0.05
 
+# ───────────────────────────────────────────────────────────────────────────────
+# SECTION: Segmentation (Path 1 — Advanced AI Vision)
+# ───────────────────────────────────────────────────────────────────────────────
+segmentation:
+  enabled: true               # Use InstanceSegmentor instead of ObjectDetector
+  model_path: models/yolo/best-seg.pt  # Custom seg model (optional)
+  fallback_model: yolov8n-seg.pt       # Auto-download if custom not found
+  frame_skip: 3               # Run seg every N frames (heavier than detection)
+  min_mask_area_px: 1500      # Ignore tiny masks (noise)
+
+grasp_pose:
+  min_confidence: 0.30        # Drop GraspPose below this confidence
+  depth_std_thresh: 0.08      # Max depth noise (m) before lowering confidence
+
+# ───────────────────────────────────────────────────────────────────────────────
+# SECTION: Path Planning (Path 2 — Advanced Robotics)
+# ───────────────────────────────────────────────────────────────────────────────
+path_planning:
+  enabled: true               # Use RRT* instead of direct IK → trajectory
+  max_iterations: 2000        # RRT* tree growth limit
+  step_size_m: 0.025          # Extension step (metres)
+  goal_bias: 0.15             # Probability of sampling goal directly
+  rewire_radius_m: 0.08       # RRT* neighbour rewire radius
+  smooth_path: true           # Apply greedy shortcutting after RRT*
+
+# ───────────────────────────────────────────────────────────────────────────────
+# SECTION: Visual Servoing (Path 2 — Closed-Loop Control)
+# ───────────────────────────────────────────────────────────────────────────────
+visual_servo:
+  enabled: false              # Set to true to enable closed-loop approach
+  pixel_tolerance: 8          # Convergence threshold (pixels)
+  area_tolerance: 500         # Convergence threshold (px² area error)
+  max_iterations: 120         # Max servo loop iterations before timeout
+  kp_x: 0.0004               # PID gains (lateral X)
+  ki_x: 0.00005
+  kd_x: 0.0001
+  kp_y: 0.0004               # PID gains (lateral Y)
+  ki_y: 0.00005
+  kd_y: 0.0001
+  kp_z: 0.0002               # PID gains (depth via area)
+  ki_z: 0.00002
+  kd_z: 0.00005
+  desired_area_px: 15000      # Target object area at pick height
+
+# ───────────────────────────────────────────────────────────────────────────────
+# SECTION: Quality Control (Path 3 — Advanced Intelligence)
+# ───────────────────────────────────────────────────────────────────────────────
+quality_control:
+  enabled: true               # Run QC inspection before every pick
+  defect_threshold: 0.55      # Score above this → reject
+  ml_model_path: models/qc/defect_classifier.onnx   # Optional ML model
+  laplacian_low_thresh: 15.0  # Texture variance below this → suspicious
+  colour_std_thresh: 45.0     # HSV std-dev above this → suspicious
+  solidity_low_thresh: 0.82   # Mask solidity below this → dented/broken
+  reject_zone_xyz: [0.00, 0.35, 0.05]  # Reject bin position (m)
+
 log_level:   INFO
 debug_video: true         # Show annotated camera feed
 dry_run:     false        # true = skip all serial commands (safe for dev)

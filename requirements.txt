@@ -3,22 +3,35 @@
 # ======================================================
 
 # Core AI / Vision
-ultralytics>=8.0.0          # YOLOv8 object detection
+ultralytics>=8.0.0          # YOLOv8 object detection + YOLOv8-Seg
 opencv-python>=4.8.0        # Camera capture & image processing
 torch>=2.1.0                # PyTorch (YOLO backbone)
 torchvision>=0.16.0         # Vision transforms
 
 # Numerical / Scientific
 numpy>=1.24.0
-scipy>=1.11.0               # Optimization (IK solver)
+scipy>=1.11.0               # Optimization (IK solver, RRT* LSQ)
 
 # Robotics Serial Communication
 pyserial>=3.5               # Serial comm with Arduino / servo controller
 # rclpy                     # ROS 2 Python client (Optional: Requires ROS 2 installation)
 
-# Depth Estimation (optional but adds serious points)
+# Depth Estimation
 open3d>=0.17.0              # 3D point cloud visualization
-# intel-realsense>=2.54.0   # Uncomment if using Intel RealSense D435
+# pyrealsense2>=2.54.0      # Uncomment if using Intel RealSense D435
+
+# ── PATH 1: Advanced AI Vision ─────────────────────────────────────────────
+# YOLOv8-Seg is included in ultralytics (no extra install required)
+# MiDaS monocular depth via torch.hub (no extra install required)
+scikit-image>=0.21.0        # Additional mask morphology utilities
+
+# ── PATH 2: Advanced Robotics ──────────────────────────────────────────────
+# RRT* path_planning.py uses only numpy + scipy (already listed above)
+# visual_servo.py uses only numpy + existing IK solver (no extra install)
+
+# ── PATH 3: Advanced Intelligence ──────────────────────────────────────────
+onnxruntime>=1.16.0         # ML defect classifier inference (optional, graceful fallback)
+# onnxruntime-gpu>=1.16.0   # GPU version — uncomment if you have CUDA
 
 # Visualization & Debugging
 matplotlib>=3.7.0

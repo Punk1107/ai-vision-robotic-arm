@@ -63,9 +63,11 @@ CLASS_COOLDOWN_S    = 5.0
 
 
 class TaskType(Enum):
-    IDLE   = auto()
-    PICK   = auto()
-    SORT   = auto()
+    IDLE       = auto()
+    PICK       = auto()
+    SORT       = auto()
+    ABORT      = auto()   # In-progress pick must be aborted (target moved too far)
+    RECOVERING = auto()   # Recalculating pick after abort
 
 
 @dataclass
@@ -78,12 +80,19 @@ class RobotTask:
     confidence:   float = 0.0
     track_id:     int   = -1
     priority:     float = 0.0
+    is_defective: bool  = False   # True → route to reject bin
+    defect_score: float = 0.0
 
     def __str__(self) -> str:
         if self.task_type == TaskType.IDLE:
             return "TASK: IDLE"
+        if self.task_type == TaskType.ABORT:
+            return "TASK: ABORT (target moved — recalculating)"
+        if self.task_type == TaskType.RECOVERING:
+            return f"TASK: RECOVERING → [{self.bin_label}]"
+        defect_tag = " [DEFECTIVE⚠]" if self.is_defective else ""
         return (
-            f"TASK: {self.task_type.name} | "
+            f"TASK: {self.task_type.name}{defect_tag} | "
             f"[bold]{self.class_name}[/bold] (track #{self.track_id}) "
             f"conf={self.confidence:.0%} priority={self.priority:.3f} "
             f"→ [{self.bin_label}]"
@@ -92,44 +101,77 @@ class RobotTask:
 
 class DecisionEngine:
     """
-    State machine with temporal consensus and priority-based selection.
+    State machine with temporal consensus, priority-based selection,
+    adaptive recovery, and quality-control integration.
 
     Args:
         mode:           "sort" or "pick".
         confirm_frames: Frames required before first pick action.
+        enable_qc:      Enable quality control inspection before pick.
+        abort_distance_m: If a tracked target moves more than this during
+                          approach, abort and recalculate (adaptive recovery).
     """
 
     def __init__(
         self,
-        mode:           str = "sort",
-        confirm_frames: int = CONFIRM_FRAMES,
+        mode:             str   = "sort",
+        confirm_frames:   int   = CONFIRM_FRAMES,
+        enable_qc:        bool  = True,
+        abort_distance_m: float = 0.04,
     ) -> None:
-        self.mode           = mode
-        self._confirm       = confirm_frames
+        self.mode             = mode
+        self._confirm         = confirm_frames
+        self._enable_qc       = enable_qc
+        self._abort_dist      = abort_distance_m
 
-        self._tracker       = CentroidTracker(
+        self._tracker = CentroidTracker(
             max_disappeared = 12,
             max_distance_px = 80.0,
         )
 
         self._last_pick_t:      float            = 0.0
         self._class_last_pick:  Dict[str, float] = defaultdict(float)
-        self._picked_tracks:    Set[int]          = set()   # track IDs already picked
+        self._picked_tracks:    Set[int]          = set()
+
+        # Adaptive recovery: track the in-progress pick target
+        self._active_track_id:   Optional[int]         = None
+        self._active_target_xyz: Optional[np.ndarray]  = None
+        self._in_approach:       bool                   = False
+
+        # QA inspector (lazy init to avoid import cycle)
+        self._qc = None
+        if enable_qc:
+            try:
+                from src.logic.quality_control import QualityInspector
+                self._qc = QualityInspector()
+                log.info("QualityInspector integrated into DecisionEngine")
+            except Exception as e:
+                log.warning(f"QC init failed: {e} — running without QC")
 
         self._total_frames = 0
         self._pick_count   = 0
+        self._defect_count = 0
+        self._abort_count  = 0
 
         log.info(
-            f"DecisionEngine v2 | mode={mode.upper()} "
-            f"| confirm={confirm_frames} frames"
+            f"DecisionEngine v3 | mode={mode.upper()} "
+            f"| confirm={confirm_frames} frames "
+            f"| qc={'on' if enable_qc else 'off'} "
+            f"| abort_dist={abort_distance_m:.3f}m"
         )
 
     # ── Main step ─────────────────────────────────────────────────────────────
-    def decide(self, detections: list, frame_area: int = 640*480) -> RobotTask:
+    def decide(
+        self,
+        detections: list,
+        frame_area: int = 640 * 480,
+        frame: Optional[np.ndarray] = None,
+    ) -> RobotTask:
         """
         Args:
             detections:  List of Detection objects from ObjectDetector.
             frame_area:  Camera resolution in pixels (for normalisation).
+            frame:       Optional current BGR frame (for QC inspection).
 
         Returns:
             RobotTask.
@@ -137,11 +179,45 @@ class DecisionEngine:
         from src.vision.detect import Detection  # avoid circular at module level
 
         self._total_frames += 1
-
-        # Update tracker
         active_tracks = self._tracker.update(detections)
 
-        # Time gates
+        # ── Adaptive recovery check ───────────────────────────────────────────
+        if self._in_approach and self._active_track_id is not None:
+            active_track = active_tracks.get(self._active_track_id)
+            if active_track is None or active_track.world_xyz is None:
+                log.warning(
+                    f"Adaptive Recovery: track #{self._active_track_id} "
+                    "lost during approach — aborting"
+                )
+                self._abort_approach()
+                return RobotTask(TaskType.ABORT)
+
+            drift = float(
+                np.linalg.norm(active_track.world_xyz - self._active_target_xyz)
+            )
+            if drift > self._abort_dist:
+                log.warning(
+                    f"Adaptive Recovery: target drifted {drift:.3f}m "
+                    f"(> {self._abort_dist:.3f}m) — recalculating"
+                )
+                self._abort_count += 1
+                self._abort_approach()
+
+                new_xyz   = active_track.world_xyz.copy()
+                bl        = SORT_MAP.get(active_track.class_name, "unknown")
+                drop_xyz  = DROP_ZONES.get(bl, DROP_ZONES["unknown"])
+                return RobotTask(
+                    task_type  = TaskType.RECOVERING,
+                    target_xyz = new_xyz,
+                    drop_xyz   = drop_xyz.copy(),
+                    class_name = active_track.class_name,
+                    bin_label  = bl,
+                    confidence = active_track.smoothed_confidence,
+                    track_id   = self._active_track_id,
+                    priority   = 1.0,
+                )
+
+        # ── Time gates ────────────────────────────────────────────────────────
         now = time.monotonic()
         if (now - self._last_pick_t) < GLOBAL_COOLDOWN_S:
             return RobotTask(TaskType.IDLE)
@@ -155,8 +231,6 @@ class DecisionEngine:
                 continue
             if track.track_id in self._picked_tracks:
                 continue
-            # Estimate area from centroid track (approx — use last known)
-            # We re-check via detection list
             if (now - self._class_last_pick[track.class_name]) < CLASS_COOLDOWN_S:
                 continue
             candidates.append(track)
@@ -167,15 +241,13 @@ class DecisionEngine:
         # Score: confidence × age_bonus × proximity_to_centre
         best: Optional[Track] = None
         best_score = -1.0
-
-        cx_frame, cy_frame = 320, 240   # assume 640×480; adjust if needed
+        cx_frame, cy_frame = 320, 240
 
         for t in candidates:
-            age_bonus    = min(t.age / 20.0, 1.0)           # saturates at 20 frames
-            cent_dist    = np.linalg.norm(t.centroid - np.array([cx_frame, cy_frame]))
-            prox_bonus   = 1.0 / (1.0 + cent_dist / 300.0)  # prefer centred objects
+            age_bonus  = min(t.age / 20.0, 1.0)
+            cent_dist  = np.linalg.norm(t.centroid - np.array([cx_frame, cy_frame]))
+            prox_bonus = 1.0 / (1.0 + cent_dist / 300.0)
             score = t.smoothed_confidence * 0.6 + age_bonus * 0.3 + prox_bonus * 0.1
-
             if score > best_score:
                 best_score = score
                 best       = t
@@ -183,32 +255,92 @@ class DecisionEngine:
         if best is None:
             return RobotTask(TaskType.IDLE)
 
-        bin_label = SORT_MAP.get(best.class_name, "unknown")
-        drop_xyz  = DROP_ZONES.get(bin_label, DROP_ZONES["unknown"])
+        # ── Quality Control Inspection ────────────────────────────────────────
+        is_defective = False
+        defect_score = 0.0
+        bin_label    = SORT_MAP.get(best.class_name, "unknown")
+
+        if self._qc is not None and frame is not None:
+            try:
+                qc_report    = self._qc.inspect(
+                    frame      = frame,
+                    mask       = self._bbox_to_mask(frame, best.centroid),
+                    class_name = best.class_name,
+                )
+                is_defective = qc_report.is_defective
+                defect_score = qc_report.defect_score
+                if is_defective:
+                    bin_label = "reject"
+                    self._defect_count += 1
+                    log.warning(
+                        f"QC: {best.class_name} DEFECTIVE "
+                        f"(score={defect_score:.2f}) → reject bin"
+                    )
+            except Exception as e:
+                log.debug(f"QC inspection failed: {e}")
+
+        if is_defective and self._qc is not None:
+            drop_xyz = self._qc.reject_zone
+        else:
+            drop_xyz = DROP_ZONES.get(bin_label, DROP_ZONES["unknown"])
 
         task = RobotTask(
-            task_type  = TaskType.SORT if self.mode == "sort" else TaskType.PICK,
-            target_xyz = best.world_xyz.copy(),
-            drop_xyz   = drop_xyz.copy(),
-            class_name = best.class_name,
-            bin_label  = bin_label,
-            confidence = best.smoothed_confidence,
-            track_id   = best.track_id,
-            priority   = best_score,
+            task_type    = TaskType.SORT if self.mode == "sort" else TaskType.PICK,
+            target_xyz   = best.world_xyz.copy(),
+            drop_xyz     = drop_xyz.copy(),
+            class_name   = best.class_name,
+            bin_label    = bin_label,
+            confidence   = best.smoothed_confidence,
+            track_id     = best.track_id,
+            priority     = best_score,
+            is_defective = is_defective,
+            defect_score = defect_score,
         )
 
-        # Commit
-        self._last_pick_t                       = now
-        self._class_last_pick[best.class_name]  = now
+        # Commit + start adaptive approach tracking
+        self._last_pick_t                      = now
+        self._class_last_pick[best.class_name] = now
         self._picked_tracks.add(best.track_id)
         self._pick_count += 1
+
+        self._active_track_id   = best.track_id
+        self._active_target_xyz = best.world_xyz.copy()
+        self._in_approach       = True
 
         log.info(str(task))
         return task
 
-    # ── Reset picked set (call after arm returns to home) ────────────────────
+    # ── Notify pick complete (stops adaptive tracking) ────────────────────────
+    def notify_pick_complete(self) -> None:
+        """Call this when the arm has physically completed the pick motion."""
+        self._abort_approach()
+        log.debug("Pick complete — approach tracking stopped")
+
+    def _abort_approach(self) -> None:
+        self._in_approach       = False
+        self._active_track_id   = None
+        self._active_target_xyz = None
+
+    # ── Mask helper ───────────────────────────────────────────────────────────
+    @staticmethod
+    def _bbox_to_mask(
+        frame:    np.ndarray,
+        centroid: np.ndarray,
+        size_px:  int = 60,
+    ) -> np.ndarray:
+        """Fallback: create a square mask around the centroid for QC."""
+        H, W  = frame.shape[:2]
+        h     = size_px // 2
+        cx, cy = int(centroid[0]), int(centroid[1])
+        mask   = np.zeros((H, W), dtype=np.uint8)
+        y0, y1 = max(0, cy - h), min(H, cy + h)
+        x0, x1 = max(0, cx - h), min(W, cx + h)
+        mask[y0:y1, x0:x1] = 1
+        return mask
+
+    # ── Reset picked set (call after arm returns to home) ─────────────────────
     def reset_picked(self) -> None:
-        """Allow previously-picked tracks to be picked again (e.g. after conveyor move)."""
+        """Allow previously-picked tracks to be picked again."""
         self._picked_tracks.clear()
         log.debug("Picked-tracks set cleared")
 
@@ -217,6 +349,8 @@ class DecisionEngine:
         return {
             "total_frames":  self._total_frames,
             "pick_count":    self._pick_count,
+            "defect_count":  self._defect_count,
+            "abort_count":   self._abort_count,
             "active_tracks": len(self._tracker.active_tracks),
             "pick_rate":     self._pick_count / max(self._total_frames, 1),
         }
