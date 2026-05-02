@@ -33,19 +33,21 @@ import numpy as np
 from src.utils.config import config, load_config
 from src.utils.logger import setup_logger, get_logger
 
-from src.vision.preprocess  import CameraPreprocessor
-from src.vision.detect      import ObjectDetector
-from src.vision.depth       import CoordinateMapper, MonocularDepthEstimator
+from src.vision.preprocess   import CameraPreprocessor
+from src.vision.segmentation import InstanceSegmentor
+from src.vision.pose         import GraspPoseEstimator
+from src.vision.depth        import CoordinateMapper, create_depth_backend
 
-from src.robotics.kinematics  import IKSolver, JointAngles
-from src.robotics.control     import RobotController
-from src.robotics.trajectory  import CubicSplinePlanner, pick_place_trajectory
+from src.robotics.kinematics   import IKSolver, JointAngles, DynamicInterceptor
+from src.robotics.control      import RobotController
+from src.robotics.path_planning import RRTStarPlanner
+from src.robotics.visual_servo  import VisualServoController
 
 from src.logic.decision import DecisionEngine, TaskType
 
 log = get_logger("main")
 
-_HOME = JointAngles(base=0, shoulder=90, elbow=0, wrist=0, gripper=0)
+_HOME = JointAngles(base=90, shoulder=90, elbow=0, wrist=90, gripper=0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -118,16 +120,19 @@ class ArmPipeline:
         self._perf = PerfMonitor()
 
         # Components (init in setup())
-        self._cap:        Optional[cv2.VideoCapture]        = None
-        self._pre:        Optional[CameraPreprocessor]      = None
-        self._detector:   Optional[ObjectDetector]          = None
-        self._mapper:     Optional[CoordinateMapper]        = None
-        self._depth_est:  Optional[MonocularDepthEstimator] = None
-        self._ik:         Optional[IKSolver]                = None
-        self._ctrl:       Optional[RobotController]         = None
-        self._decision:   Optional[DecisionEngine]          = None
-        self._planner:    Optional[CubicSplinePlanner]      = None
-        self._current_ja: JointAngles                       = _HOME
+        self._cap:         Optional[cv2.VideoCapture]    = None
+        self._pre:         Optional[CameraPreprocessor]  = None
+        self._segmentor:   Optional[InstanceSegmentor]   = None
+        self._pose_est:    Optional[GraspPoseEstimator]  = None
+        self._mapper:      Optional[CoordinateMapper]    = None
+        self._depth_est                                  = None
+        self._ik:          Optional[IKSolver]            = None
+        self._ctrl:        Optional[RobotController]     = None
+        self._decision:    Optional[DecisionEngine]      = None
+        self._rrt:         Optional[RRTStarPlanner]      = None
+        self._servo:       Optional[VisualServoController] = None
+        self._interceptor: Optional[DynamicInterceptor]  = None
+        self._current_ja:  JointAngles                   = _HOME
 
     # ── Setup ─────────────────────────────────────────────────────────────────
     def setup(self) -> None:
@@ -147,24 +152,30 @@ class ArmPipeline:
 
         log.success(f"Camera: dev={cam.device_id} {cam.width}×{cam.height}@{cam.fps}fps ✓")
 
-        self._pre      = CameraPreprocessor(equalize_hist=False)
-        self._detector = ObjectDetector(frame_skip=self._frame_skip)
-        self._mapper   = CoordinateMapper(
+        self._pre       = CameraPreprocessor(equalize_hist=False)
+        self._segmentor = InstanceSegmentor(frame_skip=self._frame_skip)
+        self._depth_est = create_depth_backend()
+        self._mapper    = CoordinateMapper(
             strategy = "depth" if config.depth.enabled else "plane"
         )
+        self._pose_est  = GraspPoseEstimator(mapper=self._mapper)
 
-        if config.depth.enabled and config.depth.method == "monocular":
-            self._depth_est = MonocularDepthEstimator(config.depth.monocular_model)
-
-        self._ik      = IKSolver(elbow_up=True)
-        self._planner = CubicSplinePlanner(hz=50)
-        self._ctrl    = RobotController()
+        self._ik          = IKSolver(elbow_up=True)
+        self._ctrl        = RobotController()
+        self._rrt         = RRTStarPlanner()
+        self._servo       = VisualServoController(ik_solver=self._ik)
+        self._interceptor = DynamicInterceptor(solver=self._ik)
 
         if not self._ctrl.connect():
             log.warning("Arm not connected — continuing in DRY RUN mode.")
 
         self._ctrl.home(blocking=True)
-        self._decision = DecisionEngine(mode=self._mode, confirm_frames=4)
+        
+        self._decision = DecisionEngine(
+            mode=self._mode, 
+            confirm_frames=4,
+            enable_qc=config.quality_control.enabled
+        )
 
         log.success("Pipeline ready. Press Ctrl+C or 'q' in video window to stop.\n")
 
@@ -200,42 +211,47 @@ class ArmPipeline:
         log.info("[vision] thread started")
 
         while self._running:
-            ret, raw = self._cap.read()
-            if not ret:
-                log.error("[vision] Camera read failed"); break
+            # 1. Read Frame & Depth
+            if hasattr(self._depth_est, "get_frames"):
+                # RealSense backend
+                raw, depth_map = self._depth_est.get_frames()
+                frame = self._pre.process(raw)
+            else:
+                # Monocular / No Depth
+                ret, raw = self._cap.read()
+                if not ret:
+                    log.error("[vision] Camera read failed")
+                    break
+                frame = self._pre.process(raw)
+                depth_map = self._depth_est.estimate(frame) if self._depth_est else None
 
             self._perf.record_frame()
 
-            # 1. Preprocess
-            frame = self._pre.process(raw)
+            # 2. Instance Segmentation
+            result = self._segmentor.segment(frame)
 
-            # 2. Depth (optional)
-            depth_map = (
-                self._depth_est.estimate(frame)
-                if self._depth_est else None
-            )
+            # 3. Pose Estimation & Coordinate Mapping
+            for seg in result.segmentations:
+                pose = self._pose_est.estimate(seg, depth_map)
+                if pose is not None:
+                    seg.world_xyz = pose.xyz
+                    seg.wrist_angle_deg = pose.wrist_angle_deg
+                else:
+                    seg.world_xyz = self._mapper.map(*seg.center_px, depth_map)
 
-            # 3. Detect
-            result = self._detector.detect(frame)
+            # 4. Decide (Tracker runs inside decision engine)
+            task = self._decision.decide(result.segmentations, frame.shape[0]*frame.shape[1], frame=frame)
 
-            # 4. Coordinate map
-            for det in result.detections:
-                cx, cy      = det.center_px
-                det.world_xyz = self._mapper.map(cx, cy, depth_map)
-
-            # 5. Decide (tracker runs inside decision engine)
-            task = self._decision.decide(result.detections, frame.shape[0]*frame.shape[1])
-
-            # 6. Push task (non-blocking: drop if control still busy)
-            if task.task_type != TaskType.IDLE:
+            # 5. Push task (non-blocking: drop if control still busy)
+            if task.task_type in (TaskType.PICK, TaskType.SORT, TaskType.RECOVERING):
                 try:
                     self._task_queue.put_nowait(task)
                 except queue.Full:
                     pass   # control thread busy, skip frame
 
-            # 7. Visualise
+            # 6. Visualise
             if config.debug_video:
-                vis = self._detector.annotate_frame(frame, result)
+                vis = self._segmentor.annotate_frame(frame, result)
                 self._draw_hud(vis, task)
                 cv2.imshow("AI Robotic Arm — Vision", vis)
 
@@ -274,75 +290,80 @@ class ArmPipeline:
         if t_pick is None or t_drop is None:
             return
 
-        # Approach: straight down (wrist -90°)
-        t0 = time.perf_counter()
-        pick_angles = ik.solve(t_pick, wrist_pitch_deg=-90,
-                               current=self._current_ja)
-        self._perf.record_ik((time.perf_counter() - t0) * 1000)
+        log.info(f"[control] Executing {task.task_type.name} to {t_pick}")
 
-        if pick_angles is None:
-            log.warning(f"IK failed for {t_pick}. Skipping task.")
-            return
+        # 1. Compute Approach Waypoint
+        lift_xyz = t_pick.copy()
+        lift_xyz[2] += 0.08  # Hover 8cm above pick point
+        
+        start_xyz = ik.forward(self._current_ja)
+        if start_xyz is None:
+            start_xyz = np.array([0.0, 0.15, 0.15]) # Safe fallback
 
-        # Lift: same XY, +8cm Z
-        lift_xyz    = t_pick.copy(); lift_xyz[2] += 0.08
-        lift_angles = ik.solve(lift_xyz, wrist_pitch_deg=-90)
-
-        drop_angles = ik.solve(t_drop, wrist_pitch_deg=0,
-                               current=lift_angles or pick_angles)
-
-        if lift_angles is None or drop_angles is None:
-            log.warning("IK failed for lift/drop — executing simpler pick.")
-            self._ctrl.move_to(pick_angles, blocking=False)
-            time.sleep(0.4)
-            self._ctrl.grip(close=True)
-            self._ctrl.home()
-            self._ctrl.grip(close=False)
-            self._perf.pick_count += 1
-            self._current_ja = _HOME
-            return
-
-        # Build smooth trajectory: home → pick → lift → drop → home
-        try:
-            traj = pick_place_trajectory(
-                home    = _HOME,
-                pick    = pick_angles,
-                lift    = lift_angles,
-                drop    = drop_angles,
-                planner = self._planner,
-                t_per_segment = 1.0,
-            )
-        except Exception as e:
-            log.warning(f"Trajectory planning failed: {e} — falling back to direct move.")
-            traj = None
-
-        if traj:
-            # Inject gripper open/close at correct waypoints
-            pick_frame = len(traj) // 4         # ~end of segment 1
-            drop_frame = 3 * len(traj) // 4     # ~end of segment 3
-
-            for i, pt in enumerate(traj):
-                self._ctrl.move_to(pt.angles)
-                if i == pick_frame:
-                    self._ctrl.grip(close=True)
-                if i == drop_frame:
-                    self._ctrl.grip(close=False)
-                    self._perf.drop_count += 1
-                time.sleep(1 / 50)   # 50Hz playback
+        # 2. Plan path with RRT*
+        if config.path_planning.enabled:
+            path = self._rrt.plan(start=start_xyz, goal=lift_xyz)
+            if not path:
+                log.warning("RRT* failed to find approach path.")
+                return
+            if config.path_planning.smooth_path:
+                path = self._rrt.smooth_path(path)
         else:
-            # Fallback: direct moves
-            for angles, delay in [
-                (pick_angles,  0.6),
-                (lift_angles,  0.4),
-                (drop_angles,  0.6),
-                (_HOME,        0.4),
-            ]:
-                self._ctrl.move_to(angles)
-                time.sleep(delay)
-            self._ctrl.grip(close=True)
-            time.sleep(0.3)
-            self._ctrl.grip(close=False)
+            path = [lift_xyz]
 
+        # 3. Execute Approach
+        for wp in path:
+            angles = ik.solve(wp, wrist_pitch_deg=-90)
+            if angles:
+                self._ctrl.move_to(angles)
+                self._current_ja = angles
+                time.sleep(0.08)
+
+        # 4. Closed-Loop Visual Servoing (Optional)
+        if config.visual_servo.enabled and self._servo:
+            def get_obs():
+                # Fetch fresh frame
+                if hasattr(self._depth_est, "get_frames"):
+                    raw, _ = self._depth_est.get_frames()
+                else:
+                    ret, raw = self._cap.read()
+                    if not ret: return None
+                fr = self._pre.process(raw)
+                res = self._segmentor.segment(fr)
+                
+                # Find matching target
+                objs = [s for s in res.segmentations if s.class_name == task.class_name]
+                if not objs: return None
+                best = max(objs, key=lambda o: o.confidence)
+                return (best.center_px[0], best.center_px[1], best.area_px)
+
+            log.info("Visual Servo Approach Started...")
+            self._servo.run(
+                get_observation=get_obs,
+                move_callback=lambda a: self._ctrl.move_to(a),
+                current_angles=self._current_ja,
+                current_xyz=lift_xyz
+            )
+
+        # 5. Final Pick Execution
+        pick_angles = ik.solve(t_pick, wrist_pitch_deg=-90)
+        if pick_angles:
+            self._ctrl.move_to(pick_angles)
+            time.sleep(0.5)
+            self._ctrl.grip(close=True)
+            self._current_ja = pick_angles
+        
+        # 6. Drop Execution
+        drop_angles = ik.solve(t_drop, wrist_pitch_deg=0)
+        if drop_angles:
+            self._ctrl.move_to(drop_angles)
+            time.sleep(0.8)
+            self._ctrl.grip(close=False)
+            self._current_ja = drop_angles
+        
+        # 7. Finalise Task
+        self._decision.notify_pick_complete()
+        self._ctrl.home()
         self._current_ja = _HOME
         self._perf.pick_count += 1
         self._decision.reset_picked()
