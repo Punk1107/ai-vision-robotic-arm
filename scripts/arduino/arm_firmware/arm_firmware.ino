@@ -1,5 +1,5 @@
 /*
- * arm_firmware.ino — AI Robotic Arm Servo Controller
+ * arm_firmware.ino — AI Robotic Arm Servo Controller (FreeRTOS Version)
  * ====================================================
  * Receives newline-delimited JSON commands from Python over USB Serial.
  * Controls 5 servos (Base, Shoulder, Elbow, Wrist, Gripper) via PWM.
@@ -23,7 +23,9 @@
  */
 
 #include <Servo.h>
-#include <ArduinoJson.h>   // v6 — install via Library Manager
+#include <ArduinoJson.h>      // v6 — install via Library Manager
+#include <Arduino_FreeRTOS.h> // FreeRTOS Library for Arduino
+#include <queue.h>
 
 // ── Pin assignments ───────────────────────────────────────────────────────────
 const int PIN_BASE     = 3;
@@ -48,12 +50,31 @@ const int HOME[5] = { 90, 90, 0, 90, 0 };
 // ── Current angles ────────────────────────────────────────────────────────────
 float currentAngles[5] = { 90, 90, 0, 90, 0 };
 
-// ── Serial buffer ─────────────────────────────────────────────────────────────
-String inputBuffer = "";
-bool   newCommand  = false;
-
 // ── E-stop flag ───────────────────────────────────────────────────────────────
-bool eStop = false;
+volatile bool eStop = false;
+
+// ── FreeRTOS Data Structures ──────────────────────────────────────────────────
+// Command structure to pass between tasks
+struct ArmCommand {
+  char cmd[16];
+  float angles[5];
+  int speed;
+  int gripValue;
+};
+
+QueueHandle_t commandQueue;
+
+// Task Handles
+TaskHandle_t TaskSerialHandle;
+TaskHandle_t TaskServoHandle;
+
+// Function Prototypes
+void TaskSerialRead(void *pvParameters);
+void TaskServoControl(void *pvParameters);
+void sweepTo(float targets[5], int stepDelayMs);
+void goHome(int stepDelayMs);
+void sendOk();
+void sendError(const char* msg);
 
 // =============================================================================
 void setup() {
@@ -67,83 +88,124 @@ void setup() {
   servoGripper.attach(PIN_GRIPPER);
 
   goHome(30);   // move to home at startup
+  
+  // Create a queue capable of containing 5 commands
+  commandQueue = xQueueCreate(5, sizeof(ArmCommand));
+
+  if (commandQueue != NULL) {
+    // Create Tasks
+    xTaskCreate(TaskSerialRead,   "SerialRead",   256, NULL, 2, &TaskSerialHandle);
+    xTaskCreate(TaskServoControl, "ServoControl", 256, NULL, 1, &TaskServoHandle);
+  } else {
+    Serial.println("{\"status\":\"error\",\"msg\":\"Queue creation failed\"}");
+  }
+
   Serial.println("{\"status\":\"ok\",\"msg\":\"arm_ready\"}");
+  // The FreeRTOS scheduler starts automatically in the Arduino port
 }
 
 // =============================================================================
 void loop() {
-  // Read serial line
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\n') {
-      newCommand = true;
-    } else {
-      inputBuffer += c;
-    }
-  }
+  // Empty. Execution is in the RTOS Tasks.
+}
 
-  if (newCommand) {
-    newCommand = false;
-    processCommand(inputBuffer);
-    inputBuffer = "";
+// =============================================================================
+// TASK 1: Read JSON from Serial
+// =============================================================================
+void TaskSerialRead(void *pvParameters) {
+  (void) pvParameters;
+  String inputBuffer = "";
+  
+  for (;;) {
+    while (Serial.available()) {
+      char c = Serial.read();
+      if (c == '\n') {
+        StaticJsonDocument<256> doc;
+        DeserializationError err = deserializeJson(doc, inputBuffer);
+        inputBuffer = "";
+
+        if (err) {
+          sendError("JSON parse failed");
+          continue;
+        }
+
+        const char* cmd = doc["cmd"];
+        if (!cmd) { sendError("missing 'cmd'"); continue; }
+
+        ArmCommand newCmd;
+        strncpy(newCmd.cmd, cmd, sizeof(newCmd.cmd) - 1);
+        newCmd.cmd[sizeof(newCmd.cmd)-1] = '\0';
+
+        if (strcmp(cmd, "estop") == 0) {
+          eStop = true;
+          // Bypass queue, detach servos immediately
+          for (int i = 0; i < 5; i++) servos[i]->detach();
+          sendOk();
+          // Clear queue
+          xQueueReset(commandQueue);
+        } 
+        else if (strcmp(cmd, "move") == 0) {
+          if (eStop) { sendError("estop active"); continue; }
+          JsonArray angles = doc["angles"];
+          if (angles.isNull() || angles.size() < 5) {
+            sendError("'angles' must have 5 elements");
+            continue;
+          }
+          for (int i = 0; i < 5; i++) newCmd.angles[i] = angles[i];
+          newCmd.speed = doc["speed"] | 50;
+          xQueueSend(commandQueue, &newCmd, portMAX_DELAY);
+        }
+        else if (strcmp(cmd, "home") == 0) {
+          eStop = false;
+          xQueueSend(commandQueue, &newCmd, portMAX_DELAY);
+        }
+        else if (strcmp(cmd, "grip") == 0) {
+          if (eStop) { sendError("estop active"); continue; }
+          newCmd.gripValue = constrain((int)doc["value"], 0, 90);
+          xQueueSend(commandQueue, &newCmd, portMAX_DELAY);
+        }
+        else {
+          sendError("unknown command");
+        }
+      } else {
+        inputBuffer += c;
+      }
+    }
+    // Yield to let other tasks run
+    vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
 
 // =============================================================================
-void processCommand(const String& raw) {
-  StaticJsonDocument<256> doc;
-  DeserializationError err = deserializeJson(doc, raw);
+// TASK 2: Control Servos smoothly
+// =============================================================================
+void TaskServoControl(void *pvParameters) {
+  (void) pvParameters;
+  ArmCommand rxCmd;
 
-  if (err) {
-    sendError("JSON parse failed");
-    return;
-  }
+  for (;;) {
+    if (xQueueReceive(commandQueue, &rxCmd, portMAX_DELAY) == pdPASS) {
+      if (eStop) continue; // Ignore commands if eStop is active
 
-  const char* cmd = doc["cmd"];
-  if (!cmd) { sendError("missing 'cmd'"); return; }
-
-  // ── move ──────────────────────────────────────────────────────────────────
-  if (strcmp(cmd, "move") == 0) {
-    if (eStop) { sendError("estop active — send 'home' to reset"); return; }
-
-    JsonArray angles = doc["angles"];
-    if (angles.isNull() || angles.size() < 5) {
-      sendError("'angles' must have 5 elements");
-      return;
+      if (strcmp(rxCmd.cmd, "move") == 0) {
+        float targets[5];
+        for (int i = 0; i < 5; i++) {
+          targets[i] = constrain(rxCmd.angles[i], LIMIT_MIN[i], LIMIT_MAX[i]);
+        }
+        int delayMs = map(rxCmd.speed, 0, 100, 30, 2);
+        sweepTo(targets, delayMs);
+        sendOk();
+      }
+      else if (strcmp(rxCmd.cmd, "home") == 0) {
+        goHome(20);
+        sendOk();
+      }
+      else if (strcmp(rxCmd.cmd, "grip") == 0) {
+        servoGripper.write(rxCmd.gripValue);
+        currentAngles[4] = rxCmd.gripValue;
+        sendOk();
+      }
     }
-
-    int speed = doc["speed"] | 50;
-    int delayMs = map(speed, 0, 100, 30, 2);  // higher speed → less delay
-
-    float targets[5];
-    for (int i = 0; i < 5; i++) {
-      targets[i] = constrain((float)angles[i], LIMIT_MIN[i], LIMIT_MAX[i]);
-    }
-    sweepTo(targets, delayMs);
-    sendOk();
-
-  // ── home ──────────────────────────────────────────────────────────────────
-  } else if (strcmp(cmd, "home") == 0) {
-    eStop = false;
-    goHome(20);
-    sendOk();
-
-  // ── grip ──────────────────────────────────────────────────────────────────
-  } else if (strcmp(cmd, "grip") == 0) {
-    int val = constrain((int)doc["value"], 0, 90);
-    servoGripper.write(val);
-    currentAngles[4] = val;
-    sendOk();
-
-  // ── estop ─────────────────────────────────────────────────────────────────
-  } else if (strcmp(cmd, "estop") == 0) {
-    eStop = true;
-    // Detach servos to remove holding torque
-    for (int i = 0; i < 5; i++) servos[i]->detach();
-    sendOk();
-
-  } else {
-    sendError("unknown command");
   }
 }
 
@@ -155,11 +217,12 @@ void sweepTo(float targets[5], int stepDelayMs) {
   for (int i = 0; i < 5; i++) starts[i] = currentAngles[i];
 
   for (int s = 1; s <= STEPS; s++) {
+    if (eStop) return; // Abort interpolation if eStop triggered
     for (int i = 0; i < 5; i++) {
       float angle = starts[i] + (targets[i] - starts[i]) * s / STEPS;
       servos[i]->write((int)angle);
     }
-    delay(stepDelayMs);
+    vTaskDelay(stepDelayMs / portTICK_PERIOD_MS);
   }
 
   for (int i = 0; i < 5; i++) currentAngles[i] = targets[i];

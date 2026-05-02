@@ -21,69 +21,52 @@
 
 ---
 
-## Overview
+## 🚀 Project Overview
 
-This project implements an end-to-end **AI-powered pick-and-place robotic arm** pipeline. A USB camera feeds into a vision thread that runs YOLOv8 object detection, estimates 3D coordinates, and tracks objects using a centroid tracker. A separate control thread consumes tasks from a shared queue, solves inverse kinematics, plans a smooth cubic-spline trajectory, and sends joint-angle commands over USB serial to an Arduino-controlled servo arm.
+This project implements a production-grade, end-to-end **AI-powered pick-and-place robotic arm** pipeline. Designed as an enterprise-ready portfolio project, it seamlessly integrates advanced Computer Vision (YOLOv8), analytical Inverse Kinematics, the **Robot Operating System (ROS 2)**, and a **Real-Time Operating System (FreeRTOS)** on the hardware layer. 
 
-The dual-thread design means the **30 FPS vision loop is never blocked** by the 1–2s arm motion cycle.
+A USB camera feeds into a high-performance vision thread that detects, maps to 3D coordinates, and tracks objects. The intelligent decision engine routes tasks to an automated pipeline, where inverse kinematics solves the exact joint angles. Commands are then executed via a real-time FreeRTOS-controlled Arduino, ensuring the **30 FPS vision loop is never blocked** by the arm's physical motion.
+
+### 🎥 Demo
+
+*(Placeholder for Demo GIF/Video)*
+![AI Robotic Arm Demo](https://via.placeholder.com/800x400/2c3e50/ecf0f1?text=AI+Robotic+Arm+Demo+-+Sorting+Action)
+
+*The system autonomously detecting objects, calculating 3D coordinates, and commanding the arm to pick and sort them into respective bins.*
 
 ---
 
 ## System Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                         AI ROBOTIC ARM SYSTEM                            │
-├──────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│   ┌─────────────┐    ┌──────────────┐    ┌──────────────────────────┐   │
-│   │ USB Camera  │───▶│ Preprocess   │───▶│   YOLOv8 Detector        │   │
-│   │ (OpenCV)    │    │ • undistort  │    │   • confidence filter    │   │
-│   └─────────────┘    │ • resize     │    │   • class filter         │   │
-│                      │ • CLAHE      │    │   • Detection dataclass  │   │
-│                      └──────────────┘    └────────────┬─────────────┘   │
-│                                                       │                  │
-│   ┌─────────────────────────────────────┐            │ DetectionResult   │
-│   │ Depth Estimation (optional)         │            ▼                  │
-│   │ MiDaS / RealSense / Stereo         │◀──▶ CoordinateMapper          │
-│   │ disparity → metric depth           │     pixel (u,v) → XYZ [m]    │
-│   └─────────────────────────────────────┘            │                  │
-│                                                       ▼                  │
-│                                            ┌──────────────────────┐     │
-│                                            │  Decision Engine     │     │
-│                                            │  • SORT_MAP          │     │
-│                                            │  • cooldown gate     │     │
-│                                            │  • RobotTask output  │     │
-│                                            └──────────┬───────────┘     │
-│                                                       │ task_queue       │
-│                                        ───────────────┼─────────────     │
-│                                         CONTROL THREAD│                  │
-│                                                       ▼                  │
-│                                            ┌──────────────────────┐     │
-│                                            │     IK Solver        │     │
-│                                            │  Analytical (fast)   │     │
-│                                            │  ↓ SLSQP fallback    │     │
-│                                            │  JointAngles (deg)   │     │
-│                                            └──────────┬───────────┘     │
-│                                                       │                  │
-│                                            ┌──────────▼───────────┐     │
-│                                            │  Trajectory Planner  │     │
-│                                            │  Cubic Spline / Trap.│     │
-│                                            └──────────┬───────────┘     │
-│                                                       │                  │
-│                                            ┌──────────▼───────────┐     │
-│                                            │  Robot Controller    │     │
-│                                            │  JSON over Serial    │     │
-│                                            │  115200 baud         │     │
-│                                            └──────────┬───────────┘     │
-│                                                       │ USB              │
-└───────────────────────────────────────────────────────┼──────────────────┘
-                                                        ▼
-                                           ┌────────────────────────┐
-                                           │  Arduino Firmware      │
-                                           │  Servo PWM control     │
-                                           │  5x Servo motors       │
-                                           └────────────────────────┘
+```mermaid
+graph TD
+    %% Define Styles
+    classDef hardware fill:#2c3e50,stroke:#34495e,stroke-width:2px,color:#ecf0f1;
+    classDef vision fill:#8e44ad,stroke:#9b59b6,stroke-width:2px,color:#fff;
+    classDef logic fill:#2980b9,stroke:#3498db,stroke-width:2px,color:#fff;
+    classDef ros fill:#27ae60,stroke:#2ecc71,stroke-width:2px,color:#fff;
+    classDef rtos fill:#c0392b,stroke:#e74c3c,stroke-width:2px,color:#fff;
+
+    %% Nodes
+    Cam[USB Camera<br/>30 FPS]:::hardware
+    YOLO[YOLOv8 Object Detection<br/>Confidence & Class Filter]:::vision
+    Depth[Depth Estimation & Mapping<br/>Pixel to World XYZ]:::vision
+    Logic[Decision Engine<br/>Task Queue & SORT_MAP]:::logic
+    ROS[ROS 2 Node / Control Bridge<br/>Topic: /vision/target]:::ros
+    IK[Inverse Kinematics Solver<br/>Analytical & SLSQP]:::logic
+    Traj[Trajectory Planner<br/>Cubic Spline 50Hz]:::logic
+    RTOS[Arduino FreeRTOS<br/>Task Queue & PWM]:::rtos
+    Arm[4-DOF Robotic Arm<br/>5x Servos]:::hardware
+
+    %% Connections
+    Cam -->|Raw Frames| YOLO
+    YOLO -->|Bounding Box & Class| Depth
+    Depth -->|3D Coordinates XYZ| Logic
+    Logic -->|RobotTask| ROS
+    ROS -->|Target Pose| IK
+    IK -->|Joint Angles| Traj
+    Traj -->|Serial JSON Comm| RTOS
+    RTOS -->|PWM Signals| Arm
 ```
 
 ### Data Flow
@@ -151,6 +134,19 @@ The dual-thread design means the **30 FPS vision loop is never blocked** by the 
 - IK solve time (ms)
 - Pick / drop counts
 - Current task and bin label overlaid on the video feed
+
+---
+
+## 🗺️ Roadmap & Milestones
+
+- [x] **Core Vision Pipeline**: YOLOv8 integration and inference loop.
+- [x] **Coordinate Mapping**: 2D pixel to 3D World XYZ (Monocular/Stereo).
+- [x] **Decision Engine**: Multi-frame consensus and priority sorting logic.
+- [x] **Inverse Kinematics**: Closed-form analytical solver + SLSQP fallback.
+- [x] **ROS 2 Integration**: Basic bridging nodes for ROS ecosystem.
+- [x] **RTOS Firmware**: FreeRTOS integration on Arduino for deterministic servo control.
+- [ ] **Real Robotic Arm Setup**: Hardware assembly, calibration, and fine-tuning.
+- [ ] **Advanced Grasping**: Integration of a depth camera for 6D pose estimation.
 
 ---
 
