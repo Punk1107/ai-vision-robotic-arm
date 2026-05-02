@@ -1,0 +1,38 @@
+# ======================================================
+# AI Vision + Robotic Arm — Requirements
+# ======================================================
+
+# Core AI / Vision
+ultralytics>=8.0.0          # YOLOv8 object detection
+opencv-python>=4.8.0        # Camera capture & image processing
+torch>=2.1.0                # PyTorch (YOLO backbone)
+torchvision>=0.16.0         # Vision transforms
+
+# Numerical / Scientific
+numpy>=1.24.0
+scipy>=1.11.0               # Optimization (IK solver)
+
+# Robotics Serial Communication
+pyserial>=3.5               # Serial comm with Arduino / servo controller
+
+# Depth Estimation (optional but adds serious points)
+open3d>=0.17.0              # 3D point cloud visualization
+# intel-realsense>=2.54.0   # Uncomment if using Intel RealSense D435
+
+# Visualization & Debugging
+matplotlib>=3.7.0
+rich>=13.0.0                # Beautiful terminal output
+loguru>=0.7.0               # Structured logging
+
+# Configuration & CLI
+pyyaml>=6.0
+click>=8.1.0                # CLI interface for main.py
+python-dotenv>=1.0.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Development
+black>=23.0.0               # Code formatter
+flake8>=6.0.0               # Linter

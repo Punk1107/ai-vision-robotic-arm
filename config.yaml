@@ -1,0 +1,54 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# config.yaml — AI Robotic Arm Configuration
+# Edit this file to tune the system without touching source code.
+# ──────────────────────────────────────────────────────────────────────────────
+
+camera:
+  device_id: 0
+  width:  1280
+  height: 720
+  fps:    30
+
+yolo:
+  # Path to your custom-trained model (set after training)
+  model_path: models/yolo/best.pt
+  fallback_model: yolov8n.pt
+  confidence_threshold: 0.45
+  iou_threshold: 0.45
+  input_size: 640
+  target_classes:
+    - cup
+    - bottle
+    - book
+    - cell phone
+    - scissors
+    - remote
+    - keyboard
+    - mouse
+    - apple
+    - orange
+
+robotics:
+  serial_port: COM3        # Change to /dev/ttyUSB0 on Linux/Mac
+  baud_rate:   115200
+  timeout:     1.0
+
+  # 4-DOF link lengths (metres) — measure your physical arm
+  l1: 0.105   # base to shoulder
+  l2: 0.105   # upper arm
+  l3: 0.090   # forearm
+  l4: 0.060   # wrist to gripper tip
+
+  move_speed: 50
+  home_speed: 30
+
+depth:
+  enabled: false          # Set to true when you have depth hardware / MiDaS
+  method:  monocular      # monocular | stereo | realsense
+  monocular_model: MiDaS_small
+  alpha: 1200.0
+  beta:  -0.05
+
+log_level:   INFO
+debug_video: true         # Show annotated camera feed
+dry_run:     false        # true = skip all serial commands (safe for dev)

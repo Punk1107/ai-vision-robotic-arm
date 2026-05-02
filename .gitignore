@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+logs/
+models/yolo/best.pt
+data/images/
+data/calibration/camera_params.json
+.venv/
+dist/
+build/

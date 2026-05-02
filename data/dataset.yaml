@@ -1,0 +1,25 @@
+# AI Robotic Arm — YOLO Dataset Config
+# =====================================
+# Used with: yolo train data=data/dataset.yaml model=yolov8n.pt epochs=100
+#
+# Collect images → label with Roboflow or LabelImg → export as YOLOv8 format
+# then point train/val paths here.
+
+path: ./data          # root (relative to project)
+train: images/train
+val:   images/val
+test:  images/test    # optional
+
+nc: 10                # number of classes
+
+names:
+  0: cup
+  1: bottle
+  2: book
+  3: cell phone
+  4: scissors
+  5: remote
+  6: keyboard
+  7: mouse
+  8: apple
+  9: orange
