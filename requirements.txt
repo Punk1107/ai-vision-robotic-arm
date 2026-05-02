@@ -14,6 +14,7 @@ scipy>=1.11.0               # Optimization (IK solver)
 
 # Robotics Serial Communication
 pyserial>=3.5               # Serial comm with Arduino / servo controller
+# rclpy                     # ROS 2 Python client (Optional: Requires ROS 2 installation)
 
 # Depth Estimation (optional but adds serious points)
 open3d>=0.17.0              # 3D point cloud visualization
