@@ -329,3 +329,116 @@ class IKSolver:
         r    = math.sqrt(x**2 + y**2)
         dist = math.sqrt(r**2 + (z - self.L1)**2)
         return self._min_reach <= dist <= self._max_reach
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dynamic Interception — predict and intercept moving objects
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DynamicInterceptor:
+    """
+    Predicts the future position of a moving object (e.g. on a conveyor belt)
+    and computes an interception waypoint for the arm.
+
+    Algorithm:
+        1. Maintain a sliding window of recent (time, xyz) observations.
+        2. Fit a linear velocity model via least-squares regression.
+        3. Project the object's position forward by `arm_delay_s` seconds
+           (the time it takes the arm to reach the interception point).
+        4. Return the predicted XYZ for the IK solver.
+
+    Usage::
+
+        interceptor = DynamicInterceptor(solver)
+        # Call every frame:
+        intercept_xyz = interceptor.update(obj_xyz, time.monotonic())
+        if intercept_xyz is not None:
+            angles = solver.solve(intercept_xyz)
+    """
+
+    def __init__(
+        self,
+        solver:        IKSolver,
+        window_s:      float = 0.5,    # history window for velocity estimation (s)
+        arm_delay_s:   float = 0.8,    # estimated arm travel time to intercept (s)
+        min_speed_mps: float = 0.005,  # below this speed → treat as stationary
+    ) -> None:
+        self._solver       = solver
+        self._window_s     = window_s
+        self._arm_delay    = arm_delay_s
+        self._min_speed    = min_speed_mps
+
+        # Ring buffer: list of (timestamp, xyz)
+        self._history: list = []
+
+        log.info(
+            f"DynamicInterceptor | window={window_s:.2f}s | "
+            f"arm_delay={arm_delay_s:.2f}s"
+        )
+
+    def update(
+        self,
+        xyz:  np.ndarray,
+        t:    float,
+    ) -> Optional[np.ndarray]:
+        """
+        Feed a new observation and return the predicted interception point.
+
+        Args:
+            xyz: Current object position in robot frame (m).
+            t:   Current timestamp (seconds, e.g. time.monotonic()).
+
+        Returns:
+            Predicted XYZ (np.ndarray) if object is moving and reachable,
+            or None if stationary / insufficient history.
+        """
+        self._history.append((t, xyz.copy()))
+
+        # Prune old samples outside the window
+        cutoff = t - self._window_s
+        self._history = [(ts, p) for ts, p in self._history if ts >= cutoff]
+
+        if len(self._history) < 3:
+            return None  # Need at least 3 points for reliable regression
+
+        times  = np.array([h[0] for h in self._history])
+        points = np.array([h[1] for h in self._history])   # (N, 3)
+
+        # Normalise time to avoid numerical issues
+        t0     = times[0]
+        t_norm = times - t0
+
+        # Least-squares linear fit per axis: xyz = a + b * t
+        velocity = np.zeros(3, dtype=np.float64)
+        for axis in range(3):
+            A = np.column_stack([np.ones_like(t_norm), t_norm])
+            result = np.linalg.lstsq(A, points[:, axis], rcond=None)
+            velocity[axis] = result[0][1]   # slope = velocity (m/s)
+
+        speed = float(np.linalg.norm(velocity))
+
+        if speed < self._min_speed:
+            log.debug(f"DynamicInterceptor: object stationary (speed={speed:.4f} m/s)")
+            return None
+
+        # Predict position at (now + arm_delay)
+        dt_predict   = (t - t0) + self._arm_delay
+        latest_xyz   = points[-1]
+        intercept    = latest_xyz + velocity * self._arm_delay
+
+        if not self._solver.is_reachable(intercept):
+            log.warning(
+                f"Interception point {intercept} is outside workspace — "
+                f"skipping."
+            )
+            return None
+
+        log.debug(
+            f"DynamicInterceptor: speed={speed:.3f}m/s | "
+            f"intercept={intercept} (in {self._arm_delay:.2f}s)"
+        )
+        return intercept
+
+    def reset(self) -> None:
+        """Clear history (call when tracking a new object)."""
+        self._history.clear()

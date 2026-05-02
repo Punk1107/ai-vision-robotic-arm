@@ -38,6 +38,7 @@ class MonocularDepthEstimator:
 
     Output is a disparity map (larger value = closer to camera).
     Use CoordinateMapper.disparity_to_depth() to get metric depth.
+    Suitable for setups without a hardware depth camera.
     """
 
     def __init__(self, model_name: str = "MiDaS_small") -> None:
@@ -61,6 +62,8 @@ class MonocularDepthEstimator:
     def estimate(self, frame_bgr: np.ndarray) -> np.ndarray:
         """
         Returns a disparity map (float32, same H×W as input).
+        Larger value = closer to camera (disparity, not metric depth).
+        Pass this to CoordinateMapper.map() with strategy="depth".
         """
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         inp = self._transform(rgb).to(self._device)
@@ -79,6 +82,128 @@ class MonocularDepthEstimator:
         """Return a colour-mapped disparity image for visualisation."""
         norm = cv2.normalize(disp, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
         return cv2.applyColorMap(norm, cv2.COLORMAP_PLASMA)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RealSense Depth Estimator (Hardware Metric Depth)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RealSenseDepthEstimator:
+    """
+    Captures aligned RGB + metric depth frames from an Intel RealSense D4xx.
+
+    Advantages over MiDaS:
+      - True metric depth (metres) — no alpha/beta calibration needed.
+      - Hardware-aligned colour + depth frames (no registration step).
+      - ~30fps depth at 848×480 with minimal CPU overhead.
+
+    Requirements:
+      pip install pyrealsense2
+
+    Falls back gracefully: if RealSense hardware or SDK is unavailable,
+    raises RuntimeError with a clear install message so the system can
+    fall back to MonocularDepthEstimator automatically.
+    """
+
+    def __init__(
+        self,
+        width:  int = 848,
+        height: int = 480,
+        fps:    int = 30,
+    ) -> None:
+        try:
+            import pyrealsense2 as rs   # type: ignore
+            self._rs = rs
+        except ImportError:
+            raise RuntimeError(
+                "pyrealsense2 not installed. "
+                "Run: pip install pyrealsense2   "
+                "(or install the Intel RealSense SDK 2.0)"
+            )
+
+        self._pipeline = self._rs.pipeline()
+        cfg = self._rs.config()
+        cfg.enable_stream(self._rs.stream.depth, width, height,
+                          self._rs.format.z16, fps)
+        cfg.enable_stream(self._rs.stream.color, width, height,
+                          self._rs.format.bgr8, fps)
+
+        try:
+            profile = self._pipeline.start(cfg)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"RealSense camera not found: {e}. "
+                "Check USB connection or set depth.method=monocular in config.yaml."
+            ) from e
+
+        # Align depth to colour frame
+        self._align = self._rs.align(self._rs.stream.color)
+
+        # Depth scale: converts raw uint16 → metres
+        depth_sensor = profile.get_device().first_depth_sensor()
+        self._depth_scale = depth_sensor.get_depth_scale()
+
+        # Retrieve colour camera intrinsics for CoordinateMapper
+        intr = (profile
+                .get_stream(self._rs.stream.color)
+                .as_video_stream_profile()
+                .get_intrinsics())
+        self._intrinsics = intr
+        self._width  = width
+        self._height = height
+
+        log.success(
+            f"RealSense ready | {width}×{height}@{fps}fps | "
+            f"depth_scale={self._depth_scale:.5f} m/unit ✓"
+        )
+
+    def get_frames(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Capture one aligned (colour, depth) frame pair.
+
+        Returns:
+            colour_bgr:  np.ndarray (H, W, 3) uint8 — BGR image.
+            depth_m:     np.ndarray (H, W)    float32 — metric depth in metres.
+                         Zero values indicate invalid / out-of-range pixels.
+        """
+        frames        = self._pipeline.wait_for_frames()
+        aligned       = self._align.process(frames)
+        colour_frame  = aligned.get_color_frame()
+        depth_frame   = aligned.get_depth_frame()
+
+        colour_bgr = np.asanyarray(colour_frame.get_data())
+        depth_raw  = np.asanyarray(depth_frame.get_data()).astype(np.float32)
+        depth_m    = depth_raw * self._depth_scale   # uint16 → metres
+
+        return colour_bgr, depth_m
+
+    def colourize(self, depth_m: np.ndarray) -> np.ndarray:
+        """Return a false-colour depth image (TURBO colourmap, clipped to 2m)."""
+        clipped  = np.clip(depth_m, 0, 2.0)
+        norm_u8  = (clipped / 2.0 * 255).astype(np.uint8)
+        return cv2.applyColorMap(norm_u8, cv2.COLORMAP_TURBO)
+
+    def camera_matrix(self) -> np.ndarray:
+        """
+        Return a 3×3 intrinsic matrix from the live RealSense stream.
+        Can be passed directly to CoordinateMapper for accurate back-projection.
+        """
+        i = self._intrinsics
+        return np.array([
+            [i.fx,  0,    i.ppx],
+            [0,     i.fy, i.ppy],
+            [0,     0,    1.0  ],
+        ], dtype=np.float64)
+
+    def stop(self) -> None:
+        self._pipeline.stop()
+        log.info("RealSense pipeline stopped.")
+
+    def __enter__(self) -> "RealSenseDepthEstimator":
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.stop()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,3 +350,51 @@ class CoordinateMapper:
         if self.strategy == "depth" and depth_map is not None:
             return self.pixel_to_world_depth(px, py, depth_map)
         return self.pixel_to_world_plane(px, py)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Factory: create the correct depth backend from config
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_depth_backend(
+    method:   Optional[str] = None,
+) -> "MonocularDepthEstimator | RealSenseDepthEstimator | None":
+    """
+    Factory that reads `depth.method` from config and returns the appropriate
+    estimator, or None if depth is disabled.
+
+    method override (str):
+        "monocular"  → MonocularDepthEstimator (MiDaS, software-only)
+        "realsense"  → RealSenseDepthEstimator (hardware, pyrealsense2)
+        "stereo"     → Not yet implemented — falls back to monocular
+
+    Falls back to monocular if RealSense is requested but hardware/SDK
+    is unavailable.
+    """
+    if not config.depth.enabled:
+        log.info("Depth backend disabled (config depth.enabled=false)")
+        return None
+
+    m = (method or config.depth.method).lower()
+
+    if m == "realsense":
+        try:
+            estimator = RealSenseDepthEstimator()
+            log.success("Depth backend: [bold]RealSense[/bold] (metric) ✓")
+            return estimator
+        except RuntimeError as e:
+            log.warning(
+                f"RealSense unavailable ({e}) — "
+                "falling back to MiDaS monocular depth."
+            )
+            m = "monocular"   # fall through
+
+    if m in ("monocular", "stereo"):
+        if m == "stereo":
+            log.warning("Stereo backend not yet implemented — using MiDaS monocular.")
+        estimator = MonocularDepthEstimator(config.depth.monocular_model)
+        log.success("Depth backend: [bold]MiDaS monocular[/bold] ✓")
+        return estimator
+
+    log.error(f"Unknown depth method '{m}'. Valid: monocular | realsense")
+    return None
