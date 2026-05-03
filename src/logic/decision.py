@@ -61,6 +61,16 @@ GLOBAL_COOLDOWN_S   = 2.0
 # Per-class cooldown (don't pick same class twice too fast)
 CLASS_COOLDOWN_S    = 5.0
 
+# Semantic Priority Map (higher is more important)
+PRIORITY_MAP: Dict[str, int] = {
+    "hazardous": 100,
+    "recycle":   80,
+    "organic":   60,
+    "general":   40,
+    "reject":    20,
+    "unknown":   0,
+}
+
 
 class TaskType(Enum):
     IDLE       = auto()
@@ -152,9 +162,13 @@ class DecisionEngine:
         self._pick_count   = 0
         self._defect_count = 0
         self._abort_count  = 0
+        
+        # Plan Queue for multi-object sequences
+        self.plan_queue: Deque[int] = deque()
+        self._last_scene_hash = ""
 
         log.info(
-            f"DecisionEngine v3 | mode={mode.upper()} "
+            f"Intelligent Task Planner v3 | mode={mode.upper()} "
             f"| confirm={confirm_frames} frames "
             f"| qc={'on' if enable_qc else 'off'} "
             f"| abort_dist={abort_distance_m:.3f}m"
@@ -224,6 +238,8 @@ class DecisionEngine:
 
         # Gather candidates
         candidates: List[Track] = []
+        scene_summary = defaultdict(int)
+        
         for track in active_tracks.values():
             if not track.is_confirmed:
                 continue
@@ -231,26 +247,66 @@ class DecisionEngine:
                 continue
             if track.track_id in self._picked_tracks:
                 continue
+            
+            # Scene graph count
+            bin_category = SORT_MAP.get(track.class_name, "unknown")
+            scene_summary[bin_category] += 1
+                
             if (now - self._class_last_pick[track.class_name]) < CLASS_COOLDOWN_S:
                 continue
             candidates.append(track)
 
+        # ── Environment Analysis (Scene Graph) ────────────────────────────────
+        # Print scene analysis if it changed significantly (using simple hash)
+        scene_hash = str(dict(scene_summary))
+        if scene_hash != self._last_scene_hash and sum(scene_summary.values()) > 0:
+            scene_desc = ", ".join(f"{v} {k}" for k, v in scene_summary.items())
+            log.info(f"[AI Planner] 👁️ Scene Analyzed: {sum(scene_summary.values())} actionable objects ({scene_desc})")
+            self._last_scene_hash = scene_hash
+
         if not candidates:
             return RobotTask(TaskType.IDLE)
 
-        # Score: confidence × age_bonus × proximity_to_centre
-        best: Optional[Track] = None
-        best_score = -1.0
+        # ── Semantic Prioritization & Plan Generation ─────────────────────────
+        # Score: Semantic Priority (dominates) + confidence + age + proximity
         cx_frame, cy_frame = 320, 240
-
+        scored_candidates = []
+        
         for t in candidates:
+            bl = SORT_MAP.get(t.class_name, "unknown")
+            sem_priority = PRIORITY_MAP.get(bl, 0)
+            
             age_bonus  = min(t.age / 20.0, 1.0)
             cent_dist  = np.linalg.norm(t.centroid - np.array([cx_frame, cy_frame]))
             prox_bonus = 1.0 / (1.0 + cent_dist / 300.0)
-            score = t.smoothed_confidence * 0.6 + age_bonus * 0.3 + prox_bonus * 0.1
-            if score > best_score:
-                best_score = score
-                best       = t
+            
+            # Final score weighting
+            score = (sem_priority * 1000) + (t.smoothed_confidence * 100) + (age_bonus * 30) + (prox_bonus * 10)
+            scored_candidates.append((score, t))
+            
+        # Sort highest score first
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        
+        # Build plan queue if empty
+        if not self.plan_queue:
+            self.plan_queue.extend([t.track_id for _, t in scored_candidates])
+            plan_desc = " -> ".join([f"Track #{t.track_id} ({SORT_MAP.get(t.class_name,'unknown')})" for _, t in scored_candidates])
+            log.info(f"[AI Planner] 📝 Generated Plan: [{plan_desc}]")
+            
+        # Extract best valid track from plan queue
+        best: Optional[Track] = None
+        best_score = 0.0
+        
+        while self.plan_queue:
+            target_id = self.plan_queue[0]
+            # Check if still valid candidate
+            valid = [item for item in scored_candidates if item[1].track_id == target_id]
+            if valid:
+                best_score, best = valid[0]
+                break
+            else:
+                # Track lost or became invalid (e.g. cooldown), pop from plan
+                self.plan_queue.popleft()
 
         if best is None:
             return RobotTask(TaskType.IDLE)
@@ -307,7 +363,11 @@ class DecisionEngine:
         self._active_target_xyz = best.world_xyz.copy()
         self._in_approach       = True
 
-        log.info(str(task))
+        # Pop from plan since we are committing to it
+        if self.plan_queue and self.plan_queue[0] == best.track_id:
+            self.plan_queue.popleft()
+
+        log.info(f"[AI Planner] 🤖 Executing Task: Prioritizing Track #{best.track_id} ({best.class_name}) due to rule: {bin_label.upper()} priority.")
         return task
 
     # ── Notify pick complete (stops adaptive tracking) ────────────────────────

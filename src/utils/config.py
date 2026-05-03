@@ -106,7 +106,7 @@ def load_config(config_path: Optional[Path] = None) -> AppConfig:
 
     path = config_path or CONFIG_FILE
     if path.exists():
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
 
         # Camera
