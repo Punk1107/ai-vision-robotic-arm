@@ -19,10 +19,10 @@
 │   └─────────────────────────────────────┘            │                  │
 │                                                       ▼                  │
 │                                            ┌──────────────────────┐     │
-│                                            │  Decision Engine     │     │
-│                                            │  • SORT_MAP          │     │
-│                                            │  • cooldown gate     │     │
-│                                            │  • RobotTask output  │     │
+│                                            │ Intelligent Planner  │     │
+│                                            │  • Scene Graph       │     │
+│                                            │  • Semantic Priority │     │
+│                                            │  • Plan Queue        │     │
 │                                            └──────────┬───────────┘     │
 │                                                       │                  │
 │                                                       ▼                  │
@@ -57,6 +57,6 @@
 | 2 | BGR frame | Depth map (float32) | `depth.py` |
 | 3 | BGR frame | DetectionResult | `detect.py` |
 | 4 | pixel (u,v) | world XYZ [m] | `depth.py` |
-| 5 | DetectionResult | RobotTask | `decision.py` |
+| 5 | DetectionResult | Plan Queue & RobotTask | `decision.py` |
 | 6 | target XYZ | JointAngles [°] | `kinematics.py` |
 | 7 | JointAngles | serial JSON | `control.py` |

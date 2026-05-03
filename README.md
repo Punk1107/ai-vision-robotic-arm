@@ -95,11 +95,12 @@ graph TD
 - **Depth estimation**: monocular MiDaS, Intel RealSense D435, or planar homography fallback
 - **Centroid tracker** with Kalman-filtered positions — eliminates jitter in pick targets
 
-### Decision Engine
-- **Temporal consensus** — object must appear in N consecutive frames before action (default: 4)
-- **Priority scoring** — balances `confidence × age_bonus × proximity-to-centre`
-- **Per-class cooldown** — prevents re-picking the same class too quickly
-- **Global cooldown gate** — enforces minimum 2s between consecutive pick operations
+### Intelligent Task Planner (Decision Engine)
+- **Environment Analysis (Scene Graph)** — Scans all tracked objects and builds a semantic understanding of the workspace before acting.
+- **Semantic Prioritization** — Overrides raw visual confidence with safety rules: `Hazardous (100) > Recyclable (80) > Organic (60) > General (40)`.
+- **Plan Queue Execution** — Formulates a sequential plan for multiple objects instead of reacting frame-by-frame.
+- **Temporal consensus** — Object must appear in N consecutive frames before action (default: 4).
+- **Explainable AI Logging** — Outputs human-readable reasoning for every decision to the terminal and video HUD.
 - **Bin routing (SORT_MAP)**:
 
   | Object | Bin |
@@ -108,6 +109,7 @@ graph TD
   | cell phone, mouse, remote, keyboard | ⚠️ hazardous |
   | book, scissors | 🗑️ general |
   | apple, orange, banana | 🌿 organic |
+  | *defective items (QC fail)* | ⛔ reject |
 
 ### Inverse Kinematics
 - **Analytical IK** (closed-form, ~0.1ms) for the 4-DOF planar arm
@@ -183,6 +185,8 @@ ai robotic arm/
 │   └── yolo/                    # Place your trained best.pt here
 ├── notebooks/                   # Jupyter notebooks for experiments
 ├── scripts/                     # Utility / calibration scripts
+│   ├── hand_eye_calibration.py  # Interactive calibration
+│   └── evaluate_accuracy.py     # Automated validation & reporting
 ├── data/                        # Datasets, calibration images
 ├── config.yaml                  # All tunable parameters
 ├── .env.example                 # Environment variable template
@@ -425,16 +429,17 @@ with RobotController() as ctrl:
     ctrl.emergency_stop()   # bypass queue immediately
 ```
 
-### `src/logic/decision.py` — Decision Engine
+### `src/logic/decision.py` — Intelligent Task Planner
 
 ```python
 from src.logic.decision import DecisionEngine
 
-engine = DecisionEngine(mode="sort", confirm_frames=4)
-task   = engine.decide(detections, frame_area=640*480)
+planner = DecisionEngine(mode="sort", confirm_frames=4, enable_qc=True)
+task   = planner.decide(detections, frame_area=640*480)
+# The planner maintains an internal queue and semantic scene graph
 # task.task_type  : TaskType.SORT | PICK | IDLE
 # task.target_xyz : np.ndarray
-# task.bin_label  : "recycle" | "hazardous" | "organic" | "general"
+# task.bin_label  : "recycle" | "hazardous" | "organic" | "general" | "reject"
 ```
 
 ---
@@ -498,6 +503,16 @@ pytest --cov=src --cov-report=term-missing
 # Run a specific test file
 pytest tests/test_kinematics.py -v
 ```
+
+### Accuracy Evaluation
+
+To formally validate the precision of the hand-eye calibration and IK solver, run the automated accuracy evaluator:
+
+```bash
+python scripts/evaluate_accuracy.py --points 5
+```
+
+This will command the arm to move to 5 known 3D coordinates, compare them against the camera's spatial estimate, and generate a markdown report (`docs/accuracy_report.md`) detailing the **Mean Absolute Error (MAE)** and **RMSE**.
 
 Test files:
 
