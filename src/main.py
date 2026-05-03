@@ -377,15 +377,22 @@ class ArmPipeline:
     def _draw_hud(self, frame: np.ndarray, task) -> None:
         h, w = frame.shape[:2]
         mode_str   = f"Mode: {self._mode.upper()}  FPS: {self._perf.fps:.1f}"
+        
+        # Add AI Planner info
+        queue_len = len(self._decision.plan_queue)
+        plan_str = f"Plan Queue: {queue_len} pending tasks"
+        
         task_str   = f"Task: {task.task_type.name}"
         if task.task_type != TaskType.IDLE:
             task_str += f"  [{task.class_name}] → [{task.bin_label}]"
         perf_str = f"Picks: {self._perf.pick_count}  IK: {self._perf.avg_ik_ms:.1f}ms"
 
         overlay = frame.copy()
-        cv2.rectangle(overlay, (0, h - 48), (w, h), (10, 10, 10), -1)
+        cv2.rectangle(overlay, (0, h - 68), (w, h), (10, 10, 10), -1)
         cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
 
+        cv2.putText(frame, f"[AI PLANNER] {plan_str}", (8, h - 48),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 150, 50), 1, cv2.LINE_AA)
         cv2.putText(frame, f"{mode_str}  |  {task_str}", (8, h - 28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 128), 1, cv2.LINE_AA)
         cv2.putText(frame, perf_str, (8, h - 10),
