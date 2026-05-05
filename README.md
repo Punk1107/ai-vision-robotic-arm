@@ -1,321 +1,232 @@
-# 🤖 AI Vision + Robotic Arm
+# AI Vision Robotic Arm
 
-> A production-ready, dual-thread Python system that fuses **real-time YOLO object detection** with **analytical inverse kinematics** to autonomously sort and manipulate objects using a 4-DOF robotic arm.
+A Python project for a camera-guided 4-DOF robotic arm. The system combines
+YOLOv8/YOLOv8-Seg vision, object tracking, task planning, inverse kinematics,
+trajectory generation, and serial control for pick-and-place or sorting demos.
 
----
+The code is designed to run in dry-run mode without hardware, then switch to a
+real Arduino-controlled arm once calibration and serial settings are ready.
 
-## 📋 Table of Contents
+## Contents
 
 - [Overview](#overview)
-- [System Architecture](#system-architecture)
+- [Architecture](#architecture)
 - [Features](#features)
-- [Project Structure](#project-structure)
-- [Hardware Requirements](#hardware-requirements)
+- [Project Layout](#project-layout)
+- [Hardware](#hardware)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Usage](#usage)
-- [Modules](#modules)
-- [Inverse Kinematics](#inverse-kinematics)
 - [Testing](#testing)
-- [Development](#development)
+- [Key Modules](#key-modules)
+- [Calibration](#calibration)
 
----
+## Overview
 
-## 🚀 Project Overview
+The main runtime is `src/main.py`. It starts two cooperating threads:
 
-This project implements a production-grade, end-to-end **AI-powered pick-and-place robotic arm** pipeline. Designed as an enterprise-ready portfolio project, it seamlessly integrates advanced Computer Vision (YOLOv8), analytical Inverse Kinematics, the **Robot Operating System (ROS 2)**, and a **Real-Time Operating System (FreeRTOS)** on the hardware layer. 
+1. Vision thread: reads camera frames, preprocesses them, runs instance
+   segmentation, estimates grasp pose and XYZ coordinates, tracks objects, and
+   asks the decision engine for the next task.
+2. Control thread: consumes `RobotTask` objects, plans an approach path, solves
+   inverse kinematics, moves the arm, grips/releases, and returns home.
 
-A USB camera feeds into a high-performance vision thread that detects, maps to 3D coordinates, and tracks objects. The intelligent decision engine routes tasks to an automated pipeline, where inverse kinematics solves the exact joint angles. Commands are then executed via a real-time FreeRTOS-controlled Arduino, ensuring the **30 FPS vision loop is never blocked** by the arm's physical motion.
+The task queue is intentionally small so old targets do not pile up while the
+physical arm is moving.
 
-### 🎥 Demo
-
-*(Placeholder for Demo GIF/Video)*
-![AI Robotic Arm Demo](https://via.placeholder.com/800x400/2c3e50/ecf0f1?text=AI+Robotic+Arm+Demo+-+Sorting+Action)
-
-*The system autonomously detecting objects, calculating 3D coordinates, and commanding the arm to pick and sort them into respective bins.*
-
----
-
-## System Architecture
+## Architecture
 
 ```mermaid
 graph TD
-    %% Define Styles
-    classDef hardware fill:#2c3e50,stroke:#34495e,stroke-width:2px,color:#ecf0f1;
-    classDef vision fill:#8e44ad,stroke:#9b59b6,stroke-width:2px,color:#fff;
-    classDef logic fill:#2980b9,stroke:#3498db,stroke-width:2px,color:#fff;
-    classDef ros fill:#27ae60,stroke:#2ecc71,stroke-width:2px,color:#fff;
-    classDef rtos fill:#c0392b,stroke:#e74c3c,stroke-width:2px,color:#fff;
-
-    %% Nodes
-    Cam[USB Camera<br/>30 FPS]:::hardware
-    YOLO[YOLOv8 Object Detection<br/>Confidence & Class Filter]:::vision
-    Depth[Depth Estimation & Mapping<br/>Pixel to World XYZ]:::vision
-    Logic[Decision Engine<br/>Task Queue & SORT_MAP]:::logic
-    ROS[ROS 2 Node / Control Bridge<br/>Topic: /vision/target]:::ros
-    IK[Inverse Kinematics Solver<br/>Analytical & SLSQP]:::logic
-    Traj[Trajectory Planner<br/>Cubic Spline 50Hz]:::logic
-    RTOS[Arduino FreeRTOS<br/>Task Queue & PWM]:::rtos
-    Arm[4-DOF Robotic Arm<br/>5x Servos]:::hardware
-
-    %% Connections
-    Cam -->|Raw Frames| YOLO
-    YOLO -->|Bounding Box & Class| Depth
-    Depth -->|3D Coordinates XYZ| Logic
-    Logic -->|RobotTask| ROS
-    ROS -->|Target Pose| IK
-    IK -->|Joint Angles| Traj
-    Traj -->|Serial JSON Comm| RTOS
-    RTOS -->|PWM Signals| Arm
+    Camera[USB camera] --> Preprocess[CameraPreprocessor]
+    Preprocess --> Segment[InstanceSegmentor / YOLOv8-Seg]
+    Segment --> Pose[GraspPoseEstimator]
+    Pose --> Mapper[CoordinateMapper]
+    Mapper --> Decision[DecisionEngine]
+    Decision --> Queue[RobotTask queue]
+    Queue --> Planner[RRTStarPlanner]
+    Planner --> IK[IKSolver]
+    IK --> Servo[VisualServoController optional]
+    Servo --> Control[RobotController]
+    IK --> Control
+    Control --> Arduino[Arduino serial firmware]
+    Arduino --> Arm[4-DOF servo arm]
 ```
 
-### Data Flow
+### Runtime Data Flow
 
-| Step | Input | Output | Module |
-|------|-------|--------|--------|
-| 1 | Raw frame | Undistorted 640×640 | `preprocess.py` |
-| 2 | BGR frame | Depth map (float32) | `depth.py` |
-| 3 | BGR frame | `DetectionResult` | `detect.py` |
-| 4 | Pixel (u,v) | World XYZ [m] | `depth.py` |
-| 5 | `DetectionResult` | `RobotTask` | `decision.py` |
-| 6 | Target XYZ | `JointAngles` [°] | `kinematics.py` |
-| 7 | `JointAngles` | Trajectory points | `trajectory.py` |
-| 8 | Trajectory | Serial JSON | `control.py` |
+| Step | Input | Output | Main module |
+| --- | --- | --- | --- |
+| 1 | Raw BGR frame | Resized/undistorted frame | `src/vision/preprocess.py` |
+| 2 | Frame | Segmented objects and masks | `src/vision/segmentation.py` |
+| 3 | Segment + depth map | Grasp pose and world XYZ | `src/vision/pose.py` |
+| 4 | Segmentations | Stable object tracks | `src/vision/tracker.py` |
+| 5 | Tracks | `RobotTask` | `src/logic/decision.py` |
+| 6 | Start/goal XYZ | Cartesian waypoints | `src/robotics/path_planning.py` |
+| 7 | Target XYZ | `JointAngles` | `src/robotics/kinematics.py` |
+| 8 | Joint angles | Serial JSON commands | `src/robotics/control.py` |
 
----
+See [docs/architecture.md](docs/architecture.md) for a fuller architecture note.
 
 ## Features
 
-### Vision Pipeline
-- **YOLOv8** object detection with letterbox preprocessing (aspect-ratio-correct)
-- **FP16 inference** on CUDA for ~2× throughput
-- **Frame-skip** mode — run heavy YOLO inference every N frames, return cached result between frames
-- **Model warm-up** on startup to eliminate the first-frame latency spike
-- **Configurable target classes** (cup, bottle, book, cell phone, scissors, remote, keyboard, mouse, apple, orange)
-- **Depth estimation**: monocular MiDaS, Intel RealSense D435, or planar homography fallback
-- **Centroid tracker** with Kalman-filtered positions — eliminates jitter in pick targets
+### Vision
 
-### Intelligent Task Planner (Decision Engine)
-- **Environment Analysis (Scene Graph)** — Scans all tracked objects and builds a semantic understanding of the workspace before acting.
-- **Semantic Prioritization** — Overrides raw visual confidence with safety rules: `Hazardous (100) > Recyclable (80) > Organic (60) > General (40)`.
-- **Plan Queue Execution** — Formulates a sequential plan for multiple objects instead of reacting frame-by-frame.
-- **Temporal consensus** — Object must appear in N consecutive frames before action (default: 4).
-- **Explainable AI Logging** — Outputs human-readable reasoning for every decision to the terminal and video HUD.
-- **Bin routing (SORT_MAP)**:
+- YOLOv8 object detection support through `ObjectDetector`.
+- YOLOv8-Seg instance segmentation through `InstanceSegmentor`.
+- Frame skipping to reduce inference load.
+- CUDA FP16 inference when available.
+- Mask PCA for object orientation and wrist-angle estimation.
+- Optional depth backends: RealSense or MiDaS monocular depth.
+- Planar coordinate fallback when depth is disabled.
+- Centroid tracking with Kalman smoothing.
 
-  | Object | Bin |
-  |--------|-----|
-  | bottle, cup, can | ♻️ recycle |
-  | cell phone, mouse, remote, keyboard | ⚠️ hazardous |
-  | book, scissors | 🗑️ general |
-  | apple, orange, banana | 🌿 organic |
-  | *defective items (QC fail)* | ⛔ reject |
+### Decision Logic
 
-### Inverse Kinematics
-- **Analytical IK** (closed-form, ~0.1ms) for the 4-DOF planar arm
-- **SLSQP numerical fallback** with joint-limit constraints when target is at workspace boundary
-- **Singularity detection** via Jacobian condition number (warns when condition > 80)
-- **Velocity safety check** — rejects moves with joint delta > 45°/step
-- Configurable **elbow-up / elbow-down** preference
+- Sort or pick mode.
+- Semantic bin routing:
 
-### Trajectory Planning
-- **Cubic Spline Planner** (C¹ continuity) — smooth multi-waypoint trajectories: `home → pick → lift → drop → home`
-- **Trapezoidal Planner** — constant-acceleration bang-coast-bang profile for fast point-to-point
-- Trajectories sampled at **50 Hz** and clamped to joint limits
+| Class | Bin |
+| --- | --- |
+| `bottle`, `cup`, `can` | `recycle` |
+| `cell phone`, `mouse`, `remote`, `keyboard` | `hazardous` |
+| `apple`, `orange`, `banana` | `organic` |
+| `book`, `scissors` | `general` |
+| unknown classes | `unknown` |
+| QC failures | `reject` |
 
-### Robot Controller
-- **Non-blocking command queue** — vision loop never waits for serial ACK
-- **Retry logic** with exponential back-off (up to 3 attempts per command)
-- **Auto-detect** USB port (scans for Arduino / CH340 / CP210 adapters)
-- **Dry-run mode** — simulates all serial commands, safe for development without hardware
-- **Emergency stop** bypasses the queue and sends `estop` immediately
-- JSON protocol over serial at **115200 baud**
+- Priority scoring by semantic category, confidence, track age, and proximity.
+- Short plan queue for multi-object scenes.
+- Global and per-class cooldowns.
+- Adaptive recovery if the active target drifts while the arm approaches.
+- Optional quality-control inspection before pick.
 
-### Performance Dashboard (HUD)
-- Live FPS counter
-- IK solve time (ms)
-- Pick / drop counts
-- Current task and bin label overlaid on the video feed
+### Robotics
 
----
+- Analytical IK for the 4-DOF arm.
+- SLSQP numerical IK fallback.
+- Joint limit clamping and singularity warnings.
+- Cartesian RRT* path planning with optional smoothing.
+- Cubic spline and trapezoidal joint-space trajectory planners.
+- Non-blocking serial command queue with retry logic.
+- Dry-run mode for development without hardware.
 
-## 🗺️ Roadmap & Milestones
+## Project Layout
 
-- [x] **Core Vision Pipeline**: YOLOv8 integration and inference loop.
-- [x] **Coordinate Mapping**: 2D pixel to 3D World XYZ (Monocular/Stereo).
-- [x] **Decision Engine**: Multi-frame consensus and priority sorting logic.
-- [x] **Inverse Kinematics**: Closed-form analytical solver + SLSQP fallback.
-- [x] **ROS 2 Integration**: Basic bridging nodes for ROS ecosystem.
-- [x] **RTOS Firmware**: FreeRTOS integration on Arduino for deterministic servo control.
-- [ ] **Real Robotic Arm Setup**: Hardware assembly, calibration, and fine-tuning.
-- [ ] **Advanced Grasping**: Integration of a depth camera for 6D pose estimation.
-
----
-
-## Project Structure
-
-```
+```text
 ai robotic arm/
-├── src/
-│   ├── main.py                  # Entry point — ArmPipeline, CLI
-│   ├── vision/
-│   │   ├── preprocess.py        # Camera undistortion, resize, CLAHE
-│   │   ├── detect.py            # YOLOv8 wrapper, Detection dataclasses
-│   │   ├── depth.py             # CoordinateMapper, MonocularDepthEstimator
-│   │   └── tracker.py           # CentroidTracker, Kalman filter
-│   ├── robotics/
-│   │   ├── kinematics.py        # IKSolver, JointAngles, Jacobian
-│   │   ├── trajectory.py        # CubicSplinePlanner, TrapezoidalPlanner
-│   │   ├── control.py           # RobotController (serial, queue, retry)
-│   │   └── calibration.py       # Camera-to-robot coordinate calibration
-│   ├── logic/
-│   │   └── decision.py          # DecisionEngine, RobotTask, SORT_MAP
-│   └── utils/
-│       ├── config.py            # Pydantic config loader (config.yaml + .env)
-│       └── logger.py            # Loguru structured logger setup
-├── tests/
-│   ├── test_tracker.py
-│   ├── test_kinematics.py
-│   ├── test_trajectory.py
-│   └── test_decision.py
-├── docs/
-│   ├── architecture.md          # System diagram & data-flow table
-│   └── ik_derivation.md         # Mathematical derivation of the IK solver
-├── models/
-│   └── yolo/                    # Place your trained best.pt here
-├── notebooks/                   # Jupyter notebooks for experiments
-├── scripts/                     # Utility / calibration scripts
-│   ├── hand_eye_calibration.py  # Interactive calibration
-│   └── evaluate_accuracy.py     # Automated validation & reporting
-├── data/                        # Datasets, calibration images
-├── config.yaml                  # All tunable parameters
-├── .env.example                 # Environment variable template
-├── requirements.txt
-└── setup.cfg
+  config.yaml
+  README.md
+  requirements.txt
+  setup.cfg
+  data/
+    dataset.yaml
+  docs/
+    architecture.md
+    ik_derivation.md
+  notebooks/
+    01_exploration.ipynb
+  scripts/
+    calibrate_camera.py
+    evaluate_accuracy.py
+    hand_eye_calibration.py
+    test_vision.py
+    arduino/arm_firmware/arm_firmware.ino
+  src/
+    main.py
+    logic/
+      decision.py
+      quality_control.py
+    robotics/
+      calibration.py
+      control.py
+      kinematics.py
+      path_planning.py
+      trajectory.py
+      visual_servo.py
+    ros/
+      ai_robotic_arm_ros/arm_node.py
+    utils/
+      config.py
+      logger.py
+    vision/
+      depth.py
+      detect.py
+      pose.py
+      preprocess.py
+      segmentation.py
+      tracker.py
+  tests/
+    test_decision.py
+    test_kinematics.py
+    test_tracker.py
+    test_trajectory.py
 ```
 
----
+## Hardware
 
-## Hardware Requirements
+| Component | Minimum |
+| --- | --- |
+| Robot arm | 4-DOF servo arm with gripper |
+| Controller | Arduino-compatible board with USB serial |
+| Camera | USB camera, 720p recommended |
+| Host | Python environment with OpenCV and PyTorch |
+| Depth sensor | Optional RealSense D4xx or monocular MiDaS |
 
-| Component | Specification |
-|-----------|--------------|
-| Robotic Arm | 4-DOF servo arm (5 servos) |
-| Microcontroller | Arduino (any variant with USB serial) |
-| Camera | USB webcam, min 720p @ 30fps |
-| PC / Host | Python 3.9+, CUDA GPU recommended |
-| Depth Sensor | *(Optional)* Intel RealSense D435 or stereo camera |
+Default arm dimensions in `src/utils/config.py`:
 
-### Arm Link Lengths (defaults)
+| Link | Default length |
+| --- | --- |
+| L1 base to shoulder | 0.105 m |
+| L2 upper arm | 0.105 m |
+| L3 forearm | 0.090 m |
+| L4 wrist to gripper tip | 0.060 m |
 
-| Link | Length |
-|------|--------|
-| L1 — base to shoulder | 105 mm |
-| L2 — upper arm | 105 mm |
-| L3 — forearm | 90 mm |
-| L4 — wrist to gripper | 60 mm |
-| **Max reach** | **255 mm** |
-
-> Measure your physical arm and update `config.yaml` accordingly.
-
----
+Measure your physical arm and update `config.yaml` or `src/utils/config.py`
+defaults before running on real hardware.
 
 ## Installation
-
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/Punk1107/ai-vision-robotic-arm.git
-cd "ai-vision-robotic-arm"
-```
-
-### 2. Create a virtual environment
 
 ```bash
 python -m venv .venv
 
-# Windows
-.venv\Scripts\activate
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
 
-# Linux / macOS
+# Linux/macOS
 source .venv/bin/activate
-```
 
-### 3. Install dependencies
-
-```bash
 pip install -r requirements.txt
 ```
 
-> **CUDA users:** Install the matching PyTorch CUDA build from [pytorch.org](https://pytorch.org) before running `pip install -r requirements.txt`.
+For CUDA, install the matching PyTorch build from <https://pytorch.org> before
+or after installing the rest of the requirements.
 
-### 4. Configure environment
+Copy the environment template if you want environment-variable overrides:
 
 ```bash
 cp .env.example .env
-# Edit .env with your serial port and preferences
 ```
-
-### 5. Place your YOLO model
-
-```
-models/yolo/best.pt   ← your custom-trained YOLOv8 weights
-```
-
-If no custom model is found, the system automatically falls back to the standard `yolov8n.pt` pretrained weights.
-
----
 
 ## Configuration
 
-All parameters are controlled from `config.yaml`. No source code changes are needed for hardware adjustments.
+Most runtime settings live in `config.yaml`.
 
-```yaml
-camera:
-  device_id: 0          # OpenCV camera index
-  width:  1280
-  height: 720
-  fps:    30
+Important settings:
 
-yolo:
-  model_path: models/yolo/best.pt
-  fallback_model: yolov8n.pt
-  confidence_threshold: 0.45
-  iou_threshold: 0.45
-  input_size: 640
-  target_classes:
-    - cup
-    - bottle
-    - book
-    - cell phone
-    - scissors
-    - remote
-    - keyboard
-    - mouse
-    - apple
-    - orange
+| Key | Purpose |
+| --- | --- |
+| `camera.device_id` | OpenCV camera index |
+| `yolo.model_path` | Custom detection model path |
+| `segmentation.model_path` | Custom segmentation model path |
+| `robotics.serial_port` | Arduino serial port, such as `COM3` |
+| `depth.enabled` | Enables depth estimation backend |
+| `path_planning.enabled` | Enables RRT* approach planning |
+| `visual_servo.enabled` | Enables closed-loop visual servoing |
+| `quality_control.enabled` | Enables defect inspection |
+| `dry_run` | Simulates serial commands when true |
 
-robotics:
-  serial_port: COM3      # /dev/ttyUSB0 on Linux/macOS
-  baud_rate:   115200
-  l1: 0.105              # Link lengths in metres
-  l2: 0.105
-  l3: 0.090
-  l4: 0.060
-  move_speed: 50
-  home_speed: 30
-
-depth:
-  enabled: false         # Enable monocular/stereo depth
-  method:  monocular     # monocular | stereo | realsense
-  monocular_model: MiDaS_small
-
-log_level:   INFO
-debug_video: true        # Show annotated camera window
-dry_run:     false       # true = skip all serial commands
-```
-
-### Environment Variables (`.env`)
+Environment variables supported by `src/utils/config.py`:
 
 ```dotenv
 ROBOT_SERIAL_PORT=COM3
@@ -323,250 +234,136 @@ YOLO_CONFIDENCE=0.45
 DRY_RUN=false
 ```
 
----
-
 ## Usage
 
-### Basic run (sort mode)
-
-```bash
-python -m src.main
-```
-
-### CLI Options
-
-```bash
-python -m src.main [OPTIONS]
-
-Options:
-  --mode [sort|pick]   Task mode (default: sort)
-  --frame-skip INT     Run YOLO every N frames; tracker interpolates (default: 2)
-  --dry                Dry-run mode — no serial commands sent
-  --port TEXT          Override serial port (e.g. COM5, /dev/ttyUSB0)
-  --conf FLOAT         Override YOLO confidence threshold
-  --debug/--no-debug   Toggle annotated video window (default: on)
-  --camera INT         OpenCV camera device index (default: 0)
-```
-
-### Examples
-
-```bash
-# Sort mode with depth enabled, camera 1
-python -m src.main --mode sort --camera 1
-
-# Pick mode, dry run (no hardware needed)
-python -m src.main --mode pick --dry
-
-# High-confidence, run YOLO every frame, custom port
-python -m src.main --conf 0.65 --frame-skip 1 --port /dev/ttyUSB0
-
-# Headless (no video window)
-python -m src.main --no-debug
-```
-
-Press **`q`** in the video window or **`Ctrl+C`** in the terminal to stop.
-
----
-
-## Modules
-
-### `src/vision/detect.py` — Object Detector
-
-```python
-from src.vision.detect import ObjectDetector
-
-detector = ObjectDetector(frame_skip=2)
-result   = detector.detect(frame)         # → DetectionResult
-# result.detections  : List[Detection]
-# result.inference_ms: float
-```
-
-Each `Detection` carries: `class_name`, `confidence`, `bbox_xyxy`, `center_px`, `area_px`, `world_xyz`, `track_id`.
-
-### `src/vision/depth.py` — Coordinate Mapper
-
-```python
-from src.vision.depth import CoordinateMapper
-
-mapper    = CoordinateMapper(strategy="plane")   # or "depth"
-world_xyz = mapper.map(cx_px, cy_px, depth_map)  # → np.ndarray [X,Y,Z] metres
-```
-
-### `src/robotics/kinematics.py` — IK Solver
-
-```python
-from src.robotics.kinematics import IKSolver
-import numpy as np
-
-ik     = IKSolver(elbow_up=True)
-angles = ik.solve(np.array([0.15, 0.10, 0.05]), wrist_pitch_deg=-90)
-# → JointAngles(base, shoulder, elbow, wrist, gripper)
-```
-
-### `src/robotics/trajectory.py` — Trajectory Planner
-
-```python
-from src.robotics.trajectory import pick_place_trajectory, CubicSplinePlanner
-
-traj = pick_place_trajectory(
-    home=home_angles, pick=pick_angles,
-    lift=lift_angles, drop=drop_angles,
-    t_per_segment=1.0,
-)
-# → List[TrajectoryPoint]  sampled at 50 Hz
-```
-
-### `src/robotics/control.py` — Robot Controller
-
-```python
-from src.robotics.control import RobotController
-
-with RobotController() as ctrl:
-    ctrl.home()
-    ctrl.move_to(angles, blocking=False)
-    ctrl.grip(close=True)
-    ctrl.play_trajectory(traj)
-    ctrl.emergency_stop()   # bypass queue immediately
-```
-
-### `src/logic/decision.py` — Intelligent Task Planner
-
-```python
-from src.logic.decision import DecisionEngine
-
-planner = DecisionEngine(mode="sort", confirm_frames=4, enable_qc=True)
-task   = planner.decide(detections, frame_area=640*480)
-# The planner maintains an internal queue and semantic scene graph
-# task.task_type  : TaskType.SORT | PICK | IDLE
-# task.target_xyz : np.ndarray
-# task.bin_label  : "recycle" | "hazardous" | "organic" | "general" | "reject"
-```
-
----
-
-## Inverse Kinematics
-
-The arm uses a **closed-form analytical solution** for the standard 4-DOF revolute-joint configuration.
-
-```
-      z
-      |   θ2
-L1    |  /L2
-[base]─┴─[shoulder]──[elbow θ3]──[wrist θ4]──◉ EE
-      θ1 (rotation around Z)
-```
-
-**Step 1 — Base angle:**
-```
-θ1 = atan2(Y, X)
-```
-
-**Step 2 — Remove wrist contribution:**
-```
-r = sqrt(X² + Y²) − L4·cos(θ4_desired)
-z = (Z − L1)      − L4·sin(θ4_desired)
-```
-
-**Step 3 — 2R planar IK (elbow-up):**
-```
-D  = (r² + z² − L2² − L3²) / (2·L2·L3)
-θ3 = atan2(−sqrt(1−D²), D)
-θ2 = atan2(z, r) − atan2(L3·sin(θ3), L2 + L3·cos(θ3))
-```
-
-**Step 4 — Wrist compensation:**
-```
-θ4 = θ4_desired − θ2 − θ3
-```
-
-When `|D| > 1` (target unreachable analytically), the solver automatically falls back to **SLSQP numerical optimisation** with joint-limit inequality constraints.
-
-| Workspace limit | Value |
-|-----------------|-------|
-| Max reach | L2 + L3 = 195 mm |
-| Min reach | \|L2 − L3\| = 15 mm |
-| Base rotation | ±90° |
-
-For the full derivation see [`docs/ik_derivation.md`](docs/ik_derivation.md).
-
----
-
-## Testing
-
-```bash
-# Run all tests
-pytest
-
-# Run with coverage report
-pytest --cov=src --cov-report=term-missing
-
-# Run a specific test file
-pytest tests/test_kinematics.py -v
-```
-
-### Accuracy Evaluation
-
-To formally validate the precision of the hand-eye calibration and IK solver, run the automated accuracy evaluator:
-
-```bash
-python scripts/evaluate_accuracy.py --points 5
-```
-
-This will command the arm to move to 5 known 3D coordinates, compare them against the camera's spatial estimate, and generate a markdown report (`docs/accuracy_report.md`) detailing the **Mean Absolute Error (MAE)** and **RMSE**.
-
-Test files:
-
-| File | Coverage |
-|------|----------|
-| `test_kinematics.py` | IK solver — analytical, numerical, singularity, reachability |
-| `test_tracker.py` | CentroidTracker — update, deregister, max_distance |
-| `test_trajectory.py` | CubicSpline & Trapezoidal planners, pick_place_trajectory |
-| `test_decision.py` | DecisionEngine — consensus, cooldown, SORT_MAP, priority scoring |
-
----
-
-## Development
-
-### Code Style
-
-```bash
-# Format
-black src/ tests/
-
-# Lint
-flake8 src/ tests/
-```
-
-### Dry-run development (no hardware)
+Dry run without a video window:
 
 ```bash
 python -m src.main --dry --no-debug
 ```
 
-In dry-run mode all serial commands are logged but never sent. This lets you develop and test the full pipeline without a physical arm.
+Sort mode with the default camera:
 
-### Adding a new target class
+```bash
+python -m src.main --mode sort
+```
 
-1. Add the class name to `target_classes` in `config.yaml`
-2. Add a bin mapping in `SORT_MAP` in `src/logic/decision.py`
-3. If needed, add a `DROP_ZONES` entry for a new bin
+Pick mode on a custom serial port:
 
-### Enabling depth estimation
+```bash
+python -m src.main --mode pick --port COM5
+```
 
-Set `depth.enabled: true` in `config.yaml` and choose a method:
+Useful CLI options:
 
-| Method | Hardware | Notes |
-|--------|----------|-------|
-| `monocular` | Any webcam | Uses MiDaS (install via `torch.hub`) |
-| `realsense` | Intel D435 | Uncomment `intel-realsense` in requirements.txt |
-| `stereo` | Stereo camera | Requires calibrated stereo setup |
+| Option | Meaning |
+| --- | --- |
+| `--mode sort|pick` | Selects task mode |
+| `--frame-skip N` | Runs segmentation every N frames |
+| `--dry` | Simulates serial commands |
+| `--port PORT` | Overrides configured serial port |
+| `--conf FLOAT` | Overrides YOLO confidence threshold |
+| `--debug/--no-debug` | Shows or hides the OpenCV window |
+| `--camera N` | Overrides camera index |
 
----
+Stop with `q` in the video window or `Ctrl+C` in the terminal.
+
+## Testing
+
+Run the suite:
+
+```bash
+python -m pytest -q
+```
+
+If pytest cache writes are restricted in your environment:
+
+```bash
+$env:PYTEST_ADDOPTS="-p no:cacheprovider"
+python -m pytest -q
+```
+
+Current test areas:
+
+| Test file | Coverage |
+| --- | --- |
+| `tests/test_kinematics.py` | Forward/analytical IK, Jacobian, safety, reachability |
+| `tests/test_tracker.py` | Track registration, pruning, smoothing, confidence |
+| `tests/test_trajectory.py` | Cubic and trapezoidal trajectory planners |
+| `tests/test_decision.py` | Task selection, bin routing, filtering, stats |
+
+## Key Modules
+
+### `src/vision/segmentation.py`
+
+```python
+segmentor = InstanceSegmentor(frame_skip=3)
+result = segmentor.segment(frame)
+best = result.best()
+```
+
+### `src/logic/decision.py`
+
+```python
+engine = DecisionEngine(mode="sort", confirm_frames=4)
+task = engine.decide(result.segmentations, frame_area=640 * 480, frame=frame)
+```
+
+### `src/robotics/kinematics.py`
+
+```python
+ik = IKSolver(elbow_up=True)
+angles = ik.solve(np.array([0.12, 0.20, 0.05]), wrist_pitch_deg=-90)
+```
+
+### `src/robotics/control.py`
+
+```python
+with RobotController() as ctrl:
+    ctrl.home()
+    ctrl.move_to(angles, blocking=True)
+    ctrl.grip(close=True)
+```
+
+## Calibration
+
+Camera intrinsics are expected at:
+
+```text
+data/calibration/camera_params.json
+```
+
+Generate camera intrinsics:
+
+```bash
+python scripts/calibrate_camera.py
+```
+
+For camera-to-robot alignment, use:
+
+```bash
+python scripts/hand_eye_calibration.py
+```
+
+Evaluate accuracy:
+
+```bash
+python scripts/evaluate_accuracy.py --points 5
+```
+
+The evaluator can produce a Markdown accuracy report when calibration and
+hardware are available.
+
+## Notes
+
+- The default segmentation model falls back to `yolov8n-seg.pt` if no custom
+  model exists.
+- The default detection model falls back to `yolov8n.pt` if no custom model
+  exists.
+- RealSense support requires `pyrealsense2`, which is intentionally optional.
+- ROS 2 support lives under `src/ros`, but the main Python pipeline can run
+  without ROS.
 
 ## License
 
-This project is intended for educational and portfolio purposes.
-
----
-
-*Built with ❤️ using Python · YOLOv8 · OpenCV · PyTorch · SciPy · PySerial*
+Educational and portfolio project.
