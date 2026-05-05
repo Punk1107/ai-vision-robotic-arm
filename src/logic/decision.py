@@ -125,7 +125,7 @@ class DecisionEngine:
     def __init__(
         self,
         mode:             str   = "sort",
-        confirm_frames:   int   = CONFIRM_FRAMES,
+        confirm_frames:   int   = 1,
         enable_qc:        bool  = True,
         abort_distance_m: float = 0.04,
     ) -> None:
@@ -193,9 +193,14 @@ class DecisionEngine:
         Returns:
             RobotTask.
         """
-        from src.vision.detect import Detection  # avoid circular at module level
-
         self._total_frames += 1
+        if hasattr(detections, "detections"):
+            detections = detections.detections
+
+        detections = [
+            d for d in detections
+            if getattr(d, "area_px", 0) >= MIN_AREA_PX
+        ]
         active_tracks = self._tracker.update(detections)
 
         # ── Adaptive recovery check ───────────────────────────────────────────
@@ -244,7 +249,7 @@ class DecisionEngine:
         scene_summary = defaultdict(int)
         
         for track in active_tracks.values():
-            if not track.is_confirmed:
+            if (track.age + 1) < self._confirm:
                 continue
             if track.world_xyz is None:
                 continue

@@ -59,8 +59,8 @@ class RoboticsConfig:
     joint_limits: dict = field(default_factory=lambda: {
         "base":     (-90,  90),
         "shoulder": (  0, 150),
-        "elbow":    (  0, 150),
-        "wrist":    (-90,  90),
+        "elbow":    (-150, 150),
+        "wrist":    (-180, 180),
         "gripper":  (  0,  90),   # 0 = open, 90 = closed
     })
 
@@ -85,11 +85,70 @@ class DepthConfig:
 
 
 @dataclass
+class SegmentationConfig:
+    enabled: bool = True
+    model_path: str = str(ROOT / "models" / "yolo" / "best-seg.pt")
+    fallback_model: str = "yolov8n-seg.pt"
+    frame_skip: int = 3
+    min_mask_area_px: int = 1500
+
+
+@dataclass
+class GraspPoseConfig:
+    min_confidence: float = 0.30
+    depth_std_thresh: float = 0.08
+
+
+@dataclass
+class PathPlanningConfig:
+    enabled: bool = True
+    max_iterations: int = 2000
+    step_size_m: float = 0.025
+    goal_bias: float = 0.15
+    rewire_radius_m: float = 0.08
+    smooth_path: bool = True
+
+
+@dataclass
+class VisualServoConfig:
+    enabled: bool = False
+    pixel_tolerance: float = 8.0
+    area_tolerance: float = 500.0
+    max_iterations: int = 120
+    kp_x: float = 0.0004
+    ki_x: float = 0.00005
+    kd_x: float = 0.0001
+    kp_y: float = 0.0004
+    ki_y: float = 0.00005
+    kd_y: float = 0.0001
+    kp_z: float = 0.0002
+    ki_z: float = 0.00002
+    kd_z: float = 0.00005
+    desired_area_px: float = 15000.0
+
+
+@dataclass
+class QualityControlConfig:
+    enabled: bool = True
+    defect_threshold: float = 0.55
+    ml_model_path: str = str(ROOT / "models" / "qc" / "defect_classifier.onnx")
+    laplacian_low_thresh: float = 15.0
+    colour_std_thresh: float = 45.0
+    solidity_low_thresh: float = 0.82
+    reject_zone_xyz: Tuple[float, float, float] = (0.00, 0.35, 0.05)
+
+
+@dataclass
 class AppConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
     yolo: YOLOConfig = field(default_factory=YOLOConfig)
     robotics: RoboticsConfig = field(default_factory=RoboticsConfig)
     depth: DepthConfig = field(default_factory=DepthConfig)
+    segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
+    grasp_pose: GraspPoseConfig = field(default_factory=GraspPoseConfig)
+    path_planning: PathPlanningConfig = field(default_factory=PathPlanningConfig)
+    visual_servo: VisualServoConfig = field(default_factory=VisualServoConfig)
+    quality_control: QualityControlConfig = field(default_factory=QualityControlConfig)
 
     log_level: str = "INFO"
     log_dir: str = str(ROOT / "logs")
@@ -132,6 +191,20 @@ def load_config(config_path: Optional[Path] = None) -> AppConfig:
             for k, v in depth.items():
                 if hasattr(cfg.depth, k):
                     setattr(cfg.depth, k, v)
+
+        # Optional feature sections
+        for section_name in (
+            "segmentation",
+            "grasp_pose",
+            "path_planning",
+            "visual_servo",
+            "quality_control",
+        ):
+            if section := data.get(section_name):
+                target = getattr(cfg, section_name)
+                for k, v in section.items():
+                    if hasattr(target, k):
+                        setattr(target, k, v)
 
         # App-level
         for k in ("log_level", "debug_video", "dry_run"):

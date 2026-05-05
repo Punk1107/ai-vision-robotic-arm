@@ -24,6 +24,7 @@ import signal
 import sys
 import threading
 import time
+from enum import Enum, auto
 from typing import Optional
 
 import click
@@ -43,7 +44,7 @@ from src.robotics.control      import RobotController
 from src.robotics.path_planning import RRTStarPlanner
 from src.robotics.visual_servo  import VisualServoController
 
-from src.logic.decision import DecisionEngine, TaskType
+from src.logic.decision import DecisionEngine, RobotTask, TaskType
 
 log = get_logger("main")
 
@@ -125,7 +126,7 @@ class ArmPipeline:
         self._running    = False
 
         # Shared task queue (maxsize=1 prevents stale tasks piling up)
-        self._task_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._task_queue: queue.Queue[Optional[RobotTask]] = queue.Queue(maxsize=1)
 
         # Performance monitor
         self._perf = PerfMonitor()
@@ -143,11 +144,9 @@ class ArmPipeline:
         self._rrt:         Optional[RRTStarPlanner]      = None
         self._servo:       Optional[VisualServoController] = None
         self._interceptor: Optional[DynamicInterceptor]  = None
-        self._interceptor: Optional[DynamicInterceptor]  = None
         self._current_ja:  JointAngles                   = _HOME
         
         # State machine members
-        self._state:       TaskState                     = TaskState.IDLE
         self._current_task: Optional[RobotTask]          = None
         self._task_lock:    threading.Lock                = threading.Lock()
         self._abort_flag:   bool                          = False
@@ -264,7 +263,7 @@ class ArmPipeline:
             task = self._decision.decide(result.segmentations, frame.shape[0]*frame.shape[1], frame=frame)
 
             # 5. Push/Update task
-            if task.task_type in (TaskType.PICK, TaskType.SORT, TaskType.RECOVERING):
+            if task.task_type in (TaskType.PICK, TaskType.SORT, TaskType.RECOVERING, TaskType.ABORT):
                 # If we get an ABORT task, trigger flag immediately
                 if task.task_type == TaskType.ABORT:
                     self._abort_flag = True
@@ -299,21 +298,23 @@ class ArmPipeline:
             status = self._ctrl.get_status()
             if status["state"] == "ERROR":
                 log.error("[control] Hardware Error detected! Attempting reset...")
-                self._state = TaskState.ERROR
+                self._task_state = TaskState.ERROR
                 self._ctrl.clear_error()
                 time.sleep(1.0)
                 continue
 
             # 2. Fetch new task if IDLE
-            if self._state == TaskState.IDLE:
+            if self._task_state == TaskState.IDLE:
                 try:
                     task = self._task_queue.get(timeout=0.2)
                     if task is None: break
                     with self._task_lock:
                         self._current_task = task
-                    self._state = TaskState.PLANNING
+                        self._active_task = task
+                    self._task_state = TaskState.PLANNING
                     self._abort_flag = False
                 except queue.Empty:
+                    pass
             if self._interrupt:
                 log.warning("[control] Interrupt received — aborting current state.")
                 self._task_state = TaskState.ABORTING
