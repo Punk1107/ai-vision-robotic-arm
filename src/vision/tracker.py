@@ -73,11 +73,11 @@ class Track:
 
     # Kalman state [x, y, vx, vy] and covariance
     kf_x:            np.ndarray = field(default_factory=lambda: np.zeros(4, np.float32))
-    kf_P:            np.ndarray = field(default_factory=lambda: np.eye(4, np.float32) * 10)
+    kf_P:            np.ndarray = field(default_factory=lambda: np.eye(4, dtype=np.float32) * 10)
 
     # 3D Kalman state [x, y, z] and covariance
     kf_xyz:          np.ndarray = field(default_factory=lambda: np.zeros(3, np.float32))
-    kf_P_xyz:        np.ndarray = field(default_factory=lambda: np.eye(3, np.float32) * 1.0)
+    kf_P_xyz:        np.ndarray = field(default_factory=lambda: np.eye(3, dtype=np.float32) * 1.0)
 
     # Detection history for temporal consensus
     conf_history:    deque = field(default_factory=lambda: deque(maxlen=10))
@@ -99,7 +99,7 @@ class Track:
         S = _H @ self.kf_P @ _H.T + _R
         K = self.kf_P @ _H.T @ np.linalg.inv(S)
         self.kf_x += K @ (z - _H @ self.kf_x)
-        self.kf_P = (np.eye(4) - K @ _H) @ self.kf_P
+        self.kf_P = (np.eye(4, dtype=np.float32) - K @ _H) @ self.kf_P
         self.centroid       = self.kf_x[:2].copy()
 
         # 3D Update (if world_xyz provided)
@@ -108,7 +108,7 @@ class Track:
             S3 = _H_3D @ self.kf_P_xyz @ _H_3D.T + _R_3D
             K3 = self.kf_P_xyz @ _H_3D.T @ np.linalg.inv(S3)
             self.kf_xyz += K3 @ (z3 - _H_3D @ self.kf_xyz)
-            self.kf_P_xyz = (np.eye(3) - K3 @ _H_3D) @ self.kf_P_xyz
+            self.kf_P_xyz = (np.eye(3, dtype=np.float32) - K3 @ _H_3D) @ self.kf_P_xyz
             self.world_xyz = self.kf_xyz.copy()
 
         self.disappeared    = 0
@@ -128,7 +128,7 @@ class Track:
     @property
     def is_confirmed(self) -> bool:
         """Track must survive at least 3 frames to be considered real."""
-        return self.age >= 3
+        return self.age >= 2
 
 
 class CentroidTracker:

@@ -19,7 +19,6 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 import torch
-from ultralytics import YOLO
 
 from src.utils.config import config
 from src.utils.logger import get_logger
@@ -136,6 +135,14 @@ class ObjectDetector:
     """
 
     def __init__(self, frame_skip: int = 2) -> None:
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise RuntimeError(
+                "ultralytics is required for ObjectDetector. "
+                "Install it with: pip install ultralytics"
+            ) from exc
+
         model_path = Path(config.yolo.model_path)
 
         if model_path.exists():

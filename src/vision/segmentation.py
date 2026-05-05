@@ -33,7 +33,6 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 import torch
-from ultralytics import YOLO
 
 from src.utils.config import config
 from src.utils.logger import get_logger
@@ -159,9 +158,15 @@ class InstanceSegmentor:
     _SEG_MODEL_NAME = "yolov8n-seg.pt"
 
     def __init__(self, frame_skip: int = 3) -> None:
-        seg_model_path = Path(config.yolo.model_path).with_name(
-            Path(config.yolo.model_path).stem + "-seg.pt"
-        )
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise RuntimeError(
+                "ultralytics is required for InstanceSegmentor. "
+                "Install it with: pip install ultralytics"
+            ) from exc
+
+        seg_model_path = Path(config.segmentation.model_path)
 
         if seg_model_path.exists():
             log.info(f"Loading custom seg model: [cyan]{seg_model_path}[/cyan]")
@@ -170,7 +175,7 @@ class InstanceSegmentor:
             log.warning(
                 f"Custom seg model not found → using [green]{self._SEG_MODEL_NAME}[/green]"
             )
-            self._model = YOLO(self._SEG_MODEL_NAME)
+            self._model = YOLO(config.segmentation.fallback_model)
 
         self._half = torch.cuda.is_available()
         if self._half:
@@ -181,7 +186,7 @@ class InstanceSegmentor:
         self._iou        = config.yolo.iou_threshold
         self._imgsz      = config.yolo.input_size
         self._targets    = set(config.yolo.target_classes)
-        self._frame_skip = max(1, frame_skip)
+        self._frame_skip = max(1, frame_skip or config.segmentation.frame_skip)
 
         self._frame_id       = 0
         self._last_result:   Optional[SegmentationResult] = None
@@ -279,6 +284,8 @@ class InstanceSegmentor:
             # ── PCA orientation ───────────────────────────────────────────────
             (cx, cy), orient = _pca_orientation(binary_mask)
             area_px = int(binary_mask.sum())
+            if area_px < config.segmentation.min_mask_area_px:
+                continue
 
             seg_objs.append(SegmentedObject(
                 class_id        = cls_id,
