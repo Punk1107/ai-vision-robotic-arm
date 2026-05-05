@@ -122,6 +122,9 @@ class ServoConfig:
     area_tol:    float = 500.0  # px²  — depth convergence
     max_iter:    int   = 120    # frames before giving up
     max_dt_s:    float = 0.2    # skip large time gaps (e.g. debugger pauses)
+    
+    # New: Convergence window (must be within tolerance for N frames)
+    convergence_window: int = 5
 
     # Desired pixel location of target (image centre by default)
     desired_cx: Optional[int] = None
@@ -215,6 +218,9 @@ class VisualServoController:
         t_start   = time.monotonic()
         t_last    = t_start
         iteration = 0
+        
+        # Track convergence over time
+        self._conv_count = 0
 
         # Estimate current EE XYZ if not provided
         if current_xyz is None and current_angles is not None:
@@ -258,6 +264,11 @@ class VisualServoController:
 
             # ── Convergence check ─────────────────────────────────────────────
             if lateral_err < cfg.pixel_tol and abs(err_area) < cfg.area_tol:
+                self._conv_count += 1
+            else:
+                self._conv_count = 0
+
+            if self._conv_count >= cfg.convergence_window:
                 elapsed = time.monotonic() - t_start
                 log.success(
                     f"Visual servo CONVERGED | "
@@ -274,9 +285,9 @@ class VisualServoController:
 
             # ── PID outputs → Cartesian corrections ──────────────────────────
             # Image-plane: +X_img → +X_robot, +Y_img → −Z_robot (camera looking down)
-            delta_x = -self._pid_x.step(err_x, dt)   # negate: right → move arm right
-            delta_z = -self._pid_y.step(err_y, dt)   # negate: down  → lower arm
-            delta_y =  self._pid_z.step(err_area, dt) # area decrease → move forward
+            delta_x = self._pid_x.step(err_x, dt)    # +err means obj is right -> move arm right (+)
+            delta_z = -self._pid_y.step(err_y, dt)   # +err means obj is down  -> move arm down (-)
+            delta_y = -self._pid_z.step(err_area, dt) # +err means too close -> move arm back (-)
 
             xyz = xyz + np.array([delta_x, delta_y, delta_z])
 

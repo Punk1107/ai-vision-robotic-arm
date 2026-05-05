@@ -57,6 +57,10 @@ class MonocularDepthEstimator:
             else transforms.dpt_transform
         )
         log.success(f"MiDaS ready on [{self._device}] ✓")
+        
+        # Temporal smoothing
+        self._last_depth: Optional[np.ndarray] = None
+        self._alpha_smooth = 0.6  # Smoothing factor (0.0 - 1.0)
 
     @torch.inference_mode()
     def estimate(self, frame_bgr: np.ndarray) -> np.ndarray:
@@ -75,8 +79,15 @@ class MonocularDepthEstimator:
             mode="bicubic",
             align_corners=False,
         ).squeeze().cpu().numpy()
+        
+        disp = disp.astype(np.float32)
 
-        return disp.astype(np.float32)
+        # Apply temporal smoothing
+        if self._last_depth is not None:
+            disp = self._alpha_smooth * disp + (1 - self._alpha_smooth) * self._last_depth
+        self._last_depth = disp.copy()
+
+        return disp
 
     def colourize(self, disp: np.ndarray) -> np.ndarray:
         """Return a colour-mapped disparity image for visualisation."""
