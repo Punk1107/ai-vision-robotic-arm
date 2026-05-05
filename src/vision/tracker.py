@@ -53,6 +53,12 @@ _H = np.array([           # Measurement model
 _Q = np.eye(4, dtype=np.float32) * 0.03   # process noise
 _R = np.eye(2, dtype=np.float32) * 2.0    # measurement noise
 
+# 3D World Filter (X, Y, Z position only)
+_F_3D = np.eye(3, dtype=np.float32)
+_H_3D = np.eye(3, dtype=np.float32)
+_Q_3D = np.eye(3, dtype=np.float32) * 0.001 # lower noise for world coords
+_R_3D = np.eye(3, dtype=np.float32) * 0.01
+
 
 @dataclass
 class Track:
@@ -69,23 +75,42 @@ class Track:
     kf_x:            np.ndarray = field(default_factory=lambda: np.zeros(4, np.float32))
     kf_P:            np.ndarray = field(default_factory=lambda: np.eye(4, np.float32) * 10)
 
+    # 3D Kalman state [x, y, z] and covariance
+    kf_xyz:          np.ndarray = field(default_factory=lambda: np.zeros(3, np.float32))
+    kf_P_xyz:        np.ndarray = field(default_factory=lambda: np.eye(3, np.float32) * 1.0)
+
     # Detection history for temporal consensus
     conf_history:    deque = field(default_factory=lambda: deque(maxlen=10))
 
     def predict(self) -> None:
         """Kalman predict step (call each frame even if not matched)."""
+        # 2D Centroid predict
         self.kf_x = _F @ self.kf_x
         self.kf_P = _F @ self.kf_P @ _F.T + _Q
         self.centroid = self.kf_x[:2].copy()
 
-    def update(self, measurement: np.ndarray, conf: float) -> None:
+        # 3D World predict
+        self.kf_P_xyz = _F_3D @ self.kf_P_xyz @ _F_3D.T + _Q_3D
+
+    def update(self, measurement: np.ndarray, conf: float, world_xyz: Optional[np.ndarray] = None) -> None:
         """Kalman update step with new centroid measurement."""
+        # 2D Update
         z = measurement.astype(np.float32)
         S = _H @ self.kf_P @ _H.T + _R
         K = self.kf_P @ _H.T @ np.linalg.inv(S)
         self.kf_x += K @ (z - _H @ self.kf_x)
         self.kf_P = (np.eye(4) - K @ _H) @ self.kf_P
         self.centroid       = self.kf_x[:2].copy()
+
+        # 3D Update (if world_xyz provided)
+        if world_xyz is not None:
+            z3 = world_xyz.astype(np.float32)
+            S3 = _H_3D @ self.kf_P_xyz @ _H_3D.T + _R_3D
+            K3 = self.kf_P_xyz @ _H_3D.T @ np.linalg.inv(S3)
+            self.kf_xyz += K3 @ (z3 - _H_3D @ self.kf_xyz)
+            self.kf_P_xyz = (np.eye(3) - K3 @ _H_3D) @ self.kf_P_xyz
+            self.world_xyz = self.kf_xyz.copy()
+
         self.disappeared    = 0
         self.age           += 1
         self.confidence     = conf
@@ -180,9 +205,8 @@ class CentroidTracker:
             det = detections[c]
             meas = np.array(det.center_px, dtype=np.float32)
 
-            self._tracks[tid].update(meas, det.confidence)
+            self._tracks[tid].update(meas, det.confidence, world_xyz=det.world_xyz)
             self._tracks[tid].class_name = det.class_name
-            self._tracks[tid].world_xyz  = det.world_xyz
 
             matched_trk.add(tid)
             matched_det.add(c)
@@ -210,6 +234,8 @@ class CentroidTracker:
             world_xyz  = det.world_xyz,
         )
         track.kf_x[:2] = track.centroid
+        if det.world_xyz is not None:
+            track.kf_xyz = det.world_xyz.astype(np.float32)
         track.conf_history.append(det.confidence)
         self._tracks[self._next_id] = track
         self._next_id += 1

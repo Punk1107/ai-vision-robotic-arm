@@ -289,6 +289,18 @@ class IKSolver:
         log.debug(f"Numerical IK → {angles} (fun={result.fun:.6f})")
         return angles
 
+    def _clamp_to_workspace(self, xyz: np.ndarray) -> np.ndarray:
+        """Ensure XYZ is within the physical workspace defined in config."""
+        ws = config.robotics
+        x = np.clip(xyz[0], *ws.workspace_x)
+        y = np.clip(xyz[1], *ws.workspace_y)
+        z = np.clip(xyz[2], *ws.workspace_z)
+        clamped = np.array([x, y, z])
+        
+        if not np.allclose(xyz, clamped, atol=1e-5):
+            log.warning(f"Target {xyz} out of bounds → clamped to {clamped}")
+        return clamped
+
     # ── Unified solve ─────────────────────────────────────────────────────────
     def solve(
         self,
@@ -307,6 +319,10 @@ class IKSolver:
         Returns:
             JointAngles or None.
         """
+        # 1. Safety first: Clamp target to reachable workspace
+        target_xyz = self._clamp_to_workspace(target_xyz)
+
+        # 2. Attempt Analytical IK (Fast)
         angles = self.solve_analytical(target_xyz, wrist_pitch_deg)
         if angles is None:
             log.info("Analytical IK out of range — trying numerical ...")

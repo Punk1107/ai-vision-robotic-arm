@@ -49,6 +49,17 @@ log = get_logger("main")
 
 _HOME = JointAngles(base=90, shoulder=90, elbow=0, wrist=90, gripper=0)
 
+class TaskState(Enum):
+    IDLE       = auto()
+    PLANNING   = auto()
+    APPROACH   = auto()
+    SERVOING   = auto()
+    PICKING    = auto()
+    PLACING    = auto()
+    HOMING     = auto()
+    ERROR      = auto()
+    ABORTING   = auto()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Performance monitor (thread-safe)
@@ -132,7 +143,17 @@ class ArmPipeline:
         self._rrt:         Optional[RRTStarPlanner]      = None
         self._servo:       Optional[VisualServoController] = None
         self._interceptor: Optional[DynamicInterceptor]  = None
+        self._interceptor: Optional[DynamicInterceptor]  = None
         self._current_ja:  JointAngles                   = _HOME
+        
+        # State machine members
+        self._state:       TaskState                     = TaskState.IDLE
+        self._current_task: Optional[RobotTask]          = None
+        self._task_lock:    threading.Lock                = threading.Lock()
+        self._abort_flag:   bool                          = False
+        self._task_state:  TaskState                     = TaskState.IDLE
+        self._active_task: Optional[RobotTask]           = None
+        self._interrupt:   bool                          = False
 
     # ── Setup ─────────────────────────────────────────────────────────────────
     def setup(self) -> None:
@@ -242,12 +263,19 @@ class ArmPipeline:
             # 4. Decide (Tracker runs inside decision engine)
             task = self._decision.decide(result.segmentations, frame.shape[0]*frame.shape[1], frame=frame)
 
-            # 5. Push task (non-blocking: drop if control still busy)
+            # 5. Push/Update task
             if task.task_type in (TaskType.PICK, TaskType.SORT, TaskType.RECOVERING):
-                try:
-                    self._task_queue.put_nowait(task)
-                except queue.Full:
-                    pass   # control thread busy, skip frame
+                # If we get an ABORT task, trigger flag immediately
+                if task.task_type == TaskType.ABORT:
+                    self._abort_flag = True
+                else:
+                    try:
+                        self._task_queue.put_nowait(task)
+                    except queue.Full:
+                        # Update current task XYZ if we are in approach/servo
+                        with self._task_lock:
+                            if self._current_task and self._current_task.track_id == task.track_id:
+                                self._current_task.target_xyz = task.target_xyz
 
             # 6. Visualise
             if config.debug_video:
@@ -267,111 +295,161 @@ class ArmPipeline:
         log.info("[control] thread started")
 
         while self._running:
-            try:
-                task = self._task_queue.get(timeout=0.5)
-            except queue.Empty:
+            # 1. Check for controller error
+            status = self._ctrl.get_status()
+            if status["state"] == "ERROR":
+                log.error("[control] Hardware Error detected! Attempting reset...")
+                self._state = TaskState.ERROR
+                self._ctrl.clear_error()
+                time.sleep(1.0)
                 continue
 
-            if task is None:   # sentinel
-                break
+            # 2. Fetch new task if IDLE
+            if self._state == TaskState.IDLE:
+                try:
+                    task = self._task_queue.get(timeout=0.2)
+                    if task is None: break
+                    with self._task_lock:
+                        self._current_task = task
+                    self._state = TaskState.PLANNING
+                    self._abort_flag = False
+                except queue.Empty:
+            if self._interrupt:
+                log.warning("[control] Interrupt received — aborting current state.")
+                self._task_state = TaskState.ABORTING
+                self._interrupt  = False
 
-            self._execute_task(task)
-            self._task_queue.task_done()
+            # 3. State Machine
+            try:
+                if self._task_state == TaskState.PLANNING:
+                    self._state_planning()
+                elif self._task_state == TaskState.APPROACH:
+                    self._state_approach()
+                elif self._task_state == TaskState.SERVOING:
+                    self._state_servoing()
+                elif self._task_state == TaskState.PICKING:
+                    self._state_picking()
+                elif self._task_state == TaskState.PLACING:
+                    self._state_placing()
+                elif self._task_state == TaskState.HOMING:
+                    self._state_homing()
+                elif self._task_state == TaskState.ABORTING:
+                    self._state_aborting()
+            except Exception as e:
+                log.error(f"[control] Error in state {self._task_state}: {e}")
+                self._task_state = TaskState.ABORTING
+
+            time.sleep(0.01)
 
         log.info("[control] thread stopped")
 
-    # ── Task execution ────────────────────────────────────────────────────────
-    def _execute_task(self, task) -> None:
+    # ── State Handlers ────────────────────────────────────────────────────────
+
+    def _state_planning(self) -> None:
+        task = self._active_task
         ik = self._ik
-
-        t_pick = task.target_xyz
-        t_drop = task.drop_xyz
-
-        if t_pick is None or t_drop is None:
-            return
-
-        log.info(f"[control] Executing {task.task_type.name} to {t_pick}")
-
-        # 1. Compute Approach Waypoint
-        lift_xyz = t_pick.copy()
-        lift_xyz[2] += 0.08  # Hover 8cm above pick point
         
         start_xyz = ik.forward(self._current_ja)
-        if start_xyz is None:
-            start_xyz = np.array([0.0, 0.15, 0.15]) # Safe fallback
+        if start_xyz is None: start_xyz = np.array([0.0, 0.15, 0.15])
+        
+        lift_xyz = task.target_xyz.copy()
+        lift_xyz[2] += 0.08
 
-        # 2. Plan path with RRT*
         if config.path_planning.enabled:
             path = self._rrt.plan(start=start_xyz, goal=lift_xyz)
             if not path:
-                log.warning("RRT* failed to find approach path.")
+                log.warning("RRT* failed. Aborting.")
+                self._task_state = TaskState.ABORTING
                 return
-            if config.path_planning.smooth_path:
-                path = self._rrt.smooth_path(path)
+            self._approach_path = self._rrt.smooth_path(path) if config.path_planning.smooth_path else path
         else:
-            path = [lift_xyz]
+            self._approach_path = [lift_xyz]
+            
+        self._approach_idx = 0
+        self._task_state = TaskState.APPROACH
 
-        # 3. Execute Approach
-        for wp in path:
-            angles = ik.solve(wp, wrist_pitch_deg=-90)
-            if angles:
-                self._ctrl.move_to(angles)
-                self._current_ja = angles
-                time.sleep(0.08)
+    def _state_approach(self) -> None:
+        if self._approach_idx >= len(self._approach_path):
+            self._task_state = TaskState.SERVOING if config.visual_servo.enabled else TaskState.PICKING
+            return
 
-        # 4. Closed-Loop Visual Servoing (Optional)
-        if config.visual_servo.enabled and self._servo:
-            def get_obs():
-                # Fetch fresh frame
-                if hasattr(self._depth_est, "get_frames"):
-                    raw, _ = self._depth_est.get_frames()
-                else:
-                    ret, raw = self._cap.read()
-                    if not ret: return None
-                fr = self._pre.process(raw)
-                res = self._segmentor.segment(fr)
-                
-                # Find matching target
-                objs = [s for s in res.segmentations if s.class_name == task.class_name]
-                if not objs: return None
-                best = max(objs, key=lambda o: o.confidence)
-                return (best.center_px[0], best.center_px[1], best.area_px)
+        wp = self._approach_path[self._approach_idx]
+        angles = self._ik.solve(wp, wrist_pitch_deg=-90, current=self._current_ja)
+        if angles:
+            self._ctrl.move_to(angles)
+            self._current_ja = angles
+            self._approach_idx += 1
+            time.sleep(0.1)
+        else:
+            log.error(f"IK failed for waypoint {self._approach_idx}. Aborting.")
+            self._task_state = TaskState.ABORTING
 
-            log.info("Visual Servo Approach Started...")
-            self._servo.run(
-                get_observation=get_obs,
-                move_callback=lambda a: self._ctrl.move_to(a),
-                current_angles=self._current_ja,
-                current_xyz=lift_xyz
-            )
+    def _state_servoing(self) -> None:
+        log.info("Visual Servo Started...")
+        task = self._active_task
+        
+        def get_obs():
+            if hasattr(self._depth_est, "get_frames"):
+                raw, _ = self._depth_est.get_frames()
+            else:
+                ret, raw = self._cap.read()
+                if not ret: return None
+            fr = self._pre.process(raw)
+            res = self._segmentor.segment(fr)
+            objs = [s for s in res.segmentations if s.class_name == task.class_name]
+            if not objs: return None
+            best = max(objs, key=lambda o: o.confidence)
+            return (best.center_px[0], best.center_px[1], best.area_px)
 
-        # 5. Final Pick Execution
-        pick_angles = ik.solve(t_pick, wrist_pitch_deg=-90)
-        if pick_angles:
-            self._ctrl.move_to(pick_angles)
-            time.sleep(0.5)
+        res = self._servo.run(
+            get_observation=get_obs,
+            move_callback=lambda a: self._ctrl.move_to(a),
+            current_angles=self._current_ja
+        )
+        self._current_ja = res.final_angles or self._current_ja
+        self._task_state = TaskState.PICKING
+
+    def _state_picking(self) -> None:
+        task = self._active_task
+        angles = self._ik.solve(task.target_xyz, wrist_pitch_deg=-90, current=self._current_ja)
+        if angles:
+            self._ctrl.move_to(angles, blocking=True)
             self._ctrl.grip(close=True)
-            self._current_ja = pick_angles
-        
-        # 6. Drop Execution
-        drop_angles = ik.solve(t_drop, wrist_pitch_deg=0)
-        if drop_angles:
-            self._ctrl.move_to(drop_angles)
-            time.sleep(0.8)
+            time.sleep(0.5)
+            self._current_ja = angles
+            self._task_state = TaskState.PLACING
+        else:
+            self._task_state = TaskState.ABORTING
+
+    def _state_placing(self) -> None:
+        task = self._active_task
+        angles = self._ik.solve(task.drop_xyz, wrist_pitch_deg=0, current=self._current_ja)
+        if angles:
+            self._ctrl.move_to(angles, blocking=True)
+            time.sleep(0.5)
             self._ctrl.grip(close=False)
-            self._current_ja = drop_angles
-        
-        # 7. Finalise Task
-        self._decision.notify_pick_complete()
-        self._ctrl.home()
+            time.sleep(0.5)
+            self._current_ja = angles
+            self._task_state = TaskState.HOMING
+        else:
+            self._task_state = TaskState.ABORTING
+
+    def _state_homing(self) -> None:
+        self._ctrl.home(blocking=True)
         self._current_ja = _HOME
+        self._decision.notify_pick_complete()
         self._perf.pick_count += 1
         self._decision.reset_picked()
+        self._task_state = TaskState.IDLE
+        log.success(f"✓ Task Complete: {self._active_task.class_name}")
 
-        log.success(
-            f"✓ Picked [{task.class_name}] → [{task.bin_label}] | "
-            f"{self._perf.summary()}"
-        )
+    def _state_aborting(self) -> None:
+        log.warning("Aborting task and returning home.")
+        self._ctrl.grip(close=False)
+        self._ctrl.home(blocking=True)
+        self._current_ja = _HOME
+        self._task_state = TaskState.IDLE
+        self._active_task = None
 
     # ── HUD overlay ───────────────────────────────────────────────────────────
     def _draw_hud(self, frame: np.ndarray, task) -> None:

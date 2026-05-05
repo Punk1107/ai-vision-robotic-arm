@@ -166,6 +166,9 @@ class DecisionEngine:
         # Plan Queue for multi-object sequences
         self.plan_queue: Deque[int] = deque()
         self._last_scene_hash = ""
+        
+        # Persistent memory for picked tracks (track_id -> expiration_time)
+        self._picked_history: Dict[int, float] = {}
 
         log.info(
             f"Intelligent Task Planner v3 | mode={mode.upper()} "
@@ -245,6 +248,14 @@ class DecisionEngine:
                 continue
             if track.world_xyz is None:
                 continue
+            
+            # Persistent memory check
+            if track.track_id in self._picked_history:
+                if (now - self._picked_history[track.track_id]) < 30.0: # 30s cooldown
+                    continue
+                else:
+                    del self._picked_history[track.track_id]
+            
             if track.track_id in self._picked_tracks:
                 continue
             
@@ -311,6 +322,18 @@ class DecisionEngine:
         if best is None:
             return RobotTask(TaskType.IDLE)
 
+        # ── Preemption check ──────────────────────────────────────────────────
+        if self._in_approach and self._active_track_id is not None:
+            active_prio = PRIORITY_MAP.get(SORT_MAP.get(active_tracks[self._active_track_id].class_name, ""), 0)
+            best_prio   = PRIORITY_MAP.get(SORT_MAP.get(best.class_name, ""), 0)
+            
+            if best_prio > active_prio + 20: # Significant priority jump
+                log.warning(f"[AI Planner] ⚡ Preemption: High priority {best.class_name} detected. Switching from track #{self._active_track_id}")
+                self._abort_approach()
+                # Continue below to issue new task
+            else:
+                return RobotTask(TaskType.IDLE) # Keep current approach
+
         # ── Quality Control Inspection ────────────────────────────────────────
         is_defective = False
         defect_score = 0.0
@@ -357,6 +380,7 @@ class DecisionEngine:
         self._last_pick_t                      = now
         self._class_last_pick[best.class_name] = now
         self._picked_tracks.add(best.track_id)
+        self._picked_history[best.track_id]    = now
         self._pick_count += 1
 
         self._active_track_id   = best.track_id

@@ -143,6 +143,22 @@ class RobotController:
     def current_angles(self) -> Optional[JointAngles]:
         return self._current_angles
 
+    def clear_error(self) -> None:
+        """Reset the controller state to IDLE if it was in ERROR."""
+        with self._lock:
+            if self._state == ArmState.ERROR:
+                log.info("Clearing controller error state...")
+                self._state = ArmState.IDLE
+            
+    def get_status(self) -> dict:
+        """Return current health and queue status."""
+        return {
+            "state": self._state.name,
+            "queue_size": self._q.qsize(),
+            "is_connected": self.is_connected,
+            "dry_run": self._dry_run
+        }
+
     # ── Worker thread ─────────────────────────────────────────────────────────
     def _start_worker(self) -> None:
         self._worker_running = True
@@ -179,9 +195,28 @@ class RobotController:
 
             if not success:
                 log.error(f"Command failed after {MAX_RETRIES} retries: {cmd.payload}")
-                self._state = ArmState.ERROR
+                with self._lock:
+                    self._state = ArmState.ERROR
+            
+            # Heartbeat check: if queue is empty, occasionally ping firmware
+            if self._q.empty() and not self._dry_run:
+                self._do_heartbeat()
 
             self._q.task_done()
+
+    def _do_heartbeat(self) -> None:
+        """Send a no-op ping to check connection health."""
+        now = time.monotonic()
+        if not hasattr(self, "_last_hb_t"): self._last_hb_t = now
+        
+        if (now - self._last_hb_t) > 5.0:  # every 5 seconds
+            try:
+                self._send_raw({"cmd": "ping"})
+                self._last_hb_t = now
+            except Exception:
+                log.error("Heartbeat failed — connection lost?")
+                with self._lock:
+                    self._state = ArmState.ERROR
 
     def _send_raw(self, payload: dict) -> bool:
         if self._dry_run:
