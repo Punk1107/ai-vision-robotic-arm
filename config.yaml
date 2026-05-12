@@ -105,6 +105,40 @@ quality_control:
   solidity_low_thresh: 0.82   # Mask solidity below this → dented/broken
   reject_zone_xyz: [0.00, 0.35, 0.05]  # Reject bin position (m)
 
+# ───────────────────────────────────────────────────────────────────────────────
+# SECTION: Input Shaping / Pulse Shaping  (Stages 1 → 3)
+# ───────────────────────────────────────────────────────────────────────────────
+input_shaping:
+
+  # ── Stage 1: Trajectory profile ──────────────────────────────────────────────
+  # planner choices: s_curve | jerk_limited | cubic | trapezoidal
+  planner:   s_curve      # s_curve is the recommended default (full 7-phase)
+  profile:   quintic      # jerk_limited sub-profile: quintic | sigmoid | cubic
+  max_vel:   120.0        # max joint velocity    (deg/s)
+  max_acc:   200.0        # max joint acceleration (deg/s²)
+  max_jerk:  800.0        # max joint jerk         (deg/s³) — s_curve only
+
+  # ── Stage 2: Classical input shaping (ZV / ZVD / EI) ─────────────────────────
+  # shaper_kind choices: zv | zvd | ei | none
+  shaper_kind: zvd        # ZVD is more robust than ZV to ωₙ uncertainty
+
+  # Natural frequency of the arm's dominant vibration mode.
+  # Measure by tapping the arm end-effector and counting oscillations, or run:
+  #   python -m scripts.measure_resonance
+  # Typical hobby 4-DOF arm: 12–25 rad/s (≈ 2–4 Hz)
+  omega_n: 18.0           # rad/s  ← TUNE THIS for your arm
+
+  # Damping ratio (0 = undamped, 1 = critically damped).
+  # Start at 0.10 and adjust based on free-oscillation decay.
+  zeta: 0.10              # dimensionless  ← TUNE THIS for your arm
+
+  # ── Stage 3: AI adaptive shaping ─────────────────────────────────────────────
+  # Requires IMU on the arm end-effector wired through firmware telemetry.
+  # When enabled, the ResonanceEstimator continuously updates ωₙ and ζ.
+  adaptive:        false  # set to true when IMU firmware is ready
+  estimator_kind:  kalman # kalman (best) | rls | fft
+  imu_sample_rate: 200.0  # Hz — must match firmware IMU output rate
+
 log_level:   INFO
 debug_video: true         # Show annotated camera feed
 dry_run:     false        # true = skip all serial commands (safe for dev)

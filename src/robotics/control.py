@@ -1,13 +1,16 @@
 """
-control.py — Robot Arm Serial Controller (v2)
+control.py — Robot Arm Serial Controller (v3)
 =============================================
-Improvements over v1:
+Improvements over v2:
+  - Stage 2/3 integration: optional input shaping (ZV/ZVD/EI) applied
+    inside play_trajectory() via a pluggable shaper object.
+  - IMU telemetry parsing: firmware JSON may include an "imu" key whose
+    values are forwarded to the ResonanceEstimator (Stage 3) for real-time
+    ωₙ / ζ tracking.
   - Async command queue: vision pipeline never blocks waiting for serial ACK.
-    A dedicated worker thread drains the queue and sends one command at a time.
   - Retry logic with exponential back-off (up to 3 attempts per command).
-  - Position feedback cache: firmware can optionally echo current angles back.
-  - Trajectory playback: accepts a list of TrajectoryPoints and plays them
-    at the configured tick rate without blocking the caller.
+  - Position feedback cache: firmware echoes current angles back.
+  - Trajectory playback: accepts List[TrajectoryPoint], optionally shaped.
 """
 
 from __future__ import annotations
@@ -64,7 +67,11 @@ class RobotController:
 
     _HOME = JointAngles(base=0, shoulder=90, elbow=0, wrist=0, gripper=0)
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        shaper=None,       # Optional[BaseShaper | AdaptiveShaper] from shaping.py
+        estimator=None,    # Optional[ResonanceEstimator] from ai_estimator.py
+    ) -> None:
         self._port    = config.robotics.serial_port
         self._baud    = config.robotics.baud_rate
         self._timeout = config.robotics.timeout
@@ -81,6 +88,18 @@ class RobotController:
 
         # Last known joint angles (from firmware echo or our own commands)
         self._current_angles: Optional[JointAngles] = None
+
+        # ── Stage 2/3: Input shaping & AI resonance estimator ─────────────────
+        self._shaper    = shaper      # plug in a ZVShaper / ZVDShaper / AdaptiveShaper
+        self._estimator = estimator   # plug in a ResonanceEstimator for Stage 3
+
+        if shaper is not None:
+            log.info(
+                f"Input shaper active: {shaper.__class__.__name__} "
+                f"(ωₙ={getattr(shaper, 'current_omega_n', '?'):.1f} rad/s)"
+            )
+        if estimator is not None:
+            log.info("AI Resonance Estimator active (Stage 3).")
 
         if self._dry_run:
             log.warning("[DRY RUN] All serial commands will be simulated.")
@@ -243,6 +262,15 @@ class RobotController:
                 a = resp["angles"]
                 self._current_angles = JointAngles(*a[:5]) if len(a) >= 5 else None
 
+            # ── Stage 3: Forward IMU telemetry to the resonance estimator ─────
+            if "imu" in resp and self._estimator is not None:
+                try:
+                    from src.robotics.ai_estimator import IMUSample
+                    imu = IMUSample.from_dict(resp["imu"])
+                    self._estimator.update(imu)
+                except Exception as _exc:
+                    log.debug(f"IMU parse error: {_exc}")
+
             return resp.get("status") == "ok"
 
         except (serial.SerialException, json.JSONDecodeError, OSError) as e:
@@ -302,18 +330,41 @@ class RobotController:
 
     def play_trajectory(
         self,
-        trajectory: list,   # List[TrajectoryPoint]
+        trajectory: list,       # List[TrajectoryPoint]
         hz: int = 50,
+        apply_shaping: bool = True,
     ) -> None:
         """
         Play a pre-planned trajectory by queuing each waypoint.
 
+        Optionally applies input shaping (Stage 2/3) before playback if a
+        shaper was provided at construction time.
+
         Args:
-            trajectory: Output of CubicSplinePlanner or TrapezoidalPlanner.
-            hz:         Playback rate (Hz).  Controls sleep between frames.
+            trajectory:     Output of any trajectory planner.
+            hz:             Playback rate (Hz).  Controls sleep between frames.
+            apply_shaping:  If True and self._shaper is set, apply the shaper
+                            before queuing points.  Set False to bypass (e.g.
+                            for homing moves where shaping isn't needed).
         """
+        traj = trajectory
+
+        # ── Stage 2/3: Apply input shaping ────────────────────────────────────
+        if apply_shaping and self._shaper is not None:
+            try:
+                # Notify estimator that a new move is starting (resets integrators)
+                if self._estimator is not None and hasattr(self._estimator, "reset_between_moves"):
+                    self._estimator.reset_between_moves()
+                traj = self._shaper.apply(trajectory)
+                log.debug(
+                    f"play_trajectory: shaped {len(trajectory)} → {len(traj)} pts"
+                )
+            except Exception as exc:
+                log.warning(f"Shaping failed ({exc}); playing unshaped trajectory.")
+                traj = trajectory
+
         dt = 1.0 / hz
-        for point in trajectory:
+        for point in traj:
             self.move_to(point.angles)
             time.sleep(dt)
         self._q.join()   # wait for all to be sent
