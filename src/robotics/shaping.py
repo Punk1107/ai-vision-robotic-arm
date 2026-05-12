@@ -171,7 +171,7 @@ class BaseShaper(ABC):
         dt = self._dt
         t0 = trajectory[0].t
 
-        # ── Extract per-joint angle arrays ────────────────────────────────────
+        # ── Extract per-joint angle arrays ─────────────────────────────────────
         n_joints    = 5
         orig_angles = np.zeros((n_total, n_joints))
         orig_vel    = np.zeros((n_total, n_joints))
@@ -182,57 +182,51 @@ class BaseShaper(ABC):
             orig_vel[i]    = pt.vel
             orig_acc[i]    = pt.acc
 
-        # Hold last position in the tail
-        for i in range(n_orig, n_total):
-            orig_angles[i] = orig_angles[n_orig - 1]
-            orig_vel[i]    = 0.0
-            orig_acc[i]    = 0.0
+        # Hold last position in the settling tail (velocity and acc stay zero)
+        orig_angles[n_orig:] = orig_angles[n_orig - 1]
 
-        # ── Convolve each joint with impulse sequence ─────────────────────────
+        # ── Convolve each joint with impulse sequence (vectorised) ─────────────
+        # All joints are processed simultaneously per impulse using NumPy slicing.
+        # No temporary per-joint arrays are allocated inside the loop.
         shaped_angles = np.zeros((n_total, n_joints))
         shaped_vel    = np.zeros((n_total, n_joints))
         shaped_acc    = np.zeros((n_total, n_joints))
 
         for imp in self._impulses:
             shift = int(round(imp.delay_s / dt))
-            for j in range(n_joints):
-                # Shift signal by ``shift`` samples
-                shifted_a = np.zeros(n_total)
-                shifted_v = np.zeros(n_total)
-                shifted_c = np.zeros(n_total)
-
-                src_start  = max(0, -shift)
-                dst_start  = max(0,  shift)
-                copy_len   = n_total - max(0, shift) - max(0, -shift)
-                if copy_len > 0:
-                    shifted_a[dst_start:dst_start + copy_len] = \
-                        orig_angles[src_start:src_start + copy_len, j]
-                    shifted_v[dst_start:dst_start + copy_len] = \
-                        orig_vel[src_start:src_start + copy_len, j]
-                    shifted_c[dst_start:dst_start + copy_len] = \
-                        orig_acc[src_start:src_start + copy_len, j]
-                else:
-                    shifted_a[:] = orig_angles[-1, j]
-
-                shaped_angles[:, j] += imp.amplitude * shifted_a
-                shaped_vel[:, j]    += imp.amplitude * shifted_v
-                shaped_acc[:, j]    += imp.amplitude * shifted_c
+            if shift == 0:
+                # No shift: add weighted original directly
+                shaped_angles += imp.amplitude * orig_angles
+                shaped_vel    += imp.amplitude * orig_vel
+                shaped_acc    += imp.amplitude * orig_acc
+            else:
+                # Shift all joints at once: src rows [0:n-shift] -> dst rows [shift:n]
+                end = n_total - shift
+                if end > 0:
+                    shaped_angles[shift:, :] += imp.amplitude * orig_angles[:end, :]
+                    shaped_vel[shift:, :]    += imp.amplitude * orig_vel[:end, :]
+                    shaped_acc[shift:, :]    += imp.amplitude * orig_acc[:end, :]
+                # Rows [0:shift] stay zero (no wrap-around — causal filter)
 
         # ── Clamp to joint limits & build output list ─────────────────────────
         limits     = config.robotics.joint_limits
         joint_keys = ["base", "shoulder", "elbow", "wrist", "gripper"]
-        out: List[TrajectoryPoint] = []
 
+        # Build clamp bounds as arrays for vectorised clip
+        lo_arr = np.array([limits[k][0] for k in joint_keys], dtype=float)
+        hi_arr = np.array([limits[k][1] for k in joint_keys], dtype=float)
+        shaped_angles = np.clip(shaped_angles, lo_arr, hi_arr)
+
+        out: List[TrajectoryPoint] = []
         for i in range(n_total):
-            t_i   = t0 + i * dt
-            clamped = []
-            for k, key in enumerate(joint_keys):
-                lo, hi = limits[key]
-                clamped.append(float(np.clip(shaped_angles[i, k], lo, hi)))
-            ja  = JointAngles(*clamped)
-            vel = list(shaped_vel[i])
-            acc = list(shaped_acc[i])
-            out.append(TrajectoryPoint(t=t_i, angles=ja, vel=vel, acc=acc))
+            t_i = t0 + i * dt
+            ja  = JointAngles(*shaped_angles[i].tolist())
+            out.append(TrajectoryPoint(
+                t=t_i,
+                angles=ja,
+                vel=shaped_vel[i].tolist(),
+                acc=shaped_acc[i].tolist(),
+            ))
 
         log.debug(
             f"{self.__class__.__name__}.apply(): "
@@ -240,6 +234,7 @@ class BaseShaper(ABC):
             f"(+{n_tail} settling pts @ ωₙ={self._omega_n:.1f} rad/s)"
         )
         return out
+
 
     # ── Subclass contract ─────────────────────────────────────────────────────
     @abstractmethod

@@ -274,7 +274,7 @@ class DecisionEngine:
 
         # ── Environment Analysis (Scene Graph) ────────────────────────────────
         # Print scene analysis if it changed significantly (using simple hash)
-        scene_hash = str(dict(scene_summary))
+        scene_hash = str(sorted(scene_summary.items()))  # sorted for deterministic comparison
         if scene_hash != self._last_scene_hash and sum(scene_summary.values()) > 0:
             scene_desc = ", ".join(f"{v} {k}" for k, v in scene_summary.items())
             log.info(f"[AI Planner] 👁️ Scene Analyzed: {sum(scene_summary.values())} actionable objects ({scene_desc})")

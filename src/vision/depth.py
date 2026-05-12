@@ -82,10 +82,15 @@ class MonocularDepthEstimator:
         
         disp = disp.astype(np.float32)
 
-        # Apply temporal smoothing
-        if self._last_depth is not None:
-            disp = self._alpha_smooth * disp + (1 - self._alpha_smooth) * self._last_depth
-        self._last_depth = disp.copy()
+        # Temporal smoothing (in-place lerp — avoids an extra full-frame copy)
+        if self._last_depth is None:
+            self._last_depth = disp
+        else:
+            # disp = alpha * disp + (1-alpha) * last  (no extra allocation)
+            np.add(disp * self._alpha_smooth,
+                   self._last_depth * (1.0 - self._alpha_smooth),
+                   out=disp)
+            self._last_depth = disp
 
         return disp
 
@@ -329,7 +334,12 @@ class CoordinateMapper:
         Returns:
             [X, Y, Z] in robot-frame metres.
         """
-        disparity = float(depth_map[py, px])
+        # Clamp pixel coords to valid depth_map range (letterbox rounding can
+        # push coordinates 1px outside the frame boundary)
+        H_d, W_d = depth_map.shape[:2]
+        px_c = int(np.clip(px, 0, W_d - 1))
+        py_c = int(np.clip(py, 0, H_d - 1))
+        disparity = float(depth_map[py_c, px_c])
         # Convert disparity → metric depth
         z_cam = self._alpha / (disparity + 1e-6) + self._beta
 

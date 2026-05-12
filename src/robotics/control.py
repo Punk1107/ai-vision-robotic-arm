@@ -86,8 +86,13 @@ class RobotController:
         self._worker: Optional[threading.Thread]      = None
         self._worker_running = False
 
+        # Heartbeat tracking: time of last successful serial transmission
+        self._last_tx_t: float = 0.0
+
         # Last known joint angles (from firmware echo or our own commands)
         self._current_angles: Optional[JointAngles] = None
+        # Last command actually sent — used for dead-band deduplication
+        self._last_sent_angles: Optional[JointAngles] = None
 
         # ── Stage 2/3: Input shaping & AI resonance estimator ─────────────────
         self._shaper    = shaper      # plug in a ZVShaper / ZVDShaper / AdaptiveShaper
@@ -188,7 +193,17 @@ class RobotController:
 
     def _stop_worker(self) -> None:
         self._worker_running = False
-        self._q.put(None)   # sentinel to unblock the worker
+        # Drain the queue first so put_nowait cannot block on a full queue
+        while not self._q.empty():
+            try:
+                self._q.get_nowait()
+                self._q.task_done()
+            except queue.Empty:
+                break
+        try:
+            self._q.put_nowait(None)   # sentinel to unblock the worker
+        except queue.Full:
+            pass   # worker will exit via _worker_running flag
         if self._worker:
             self._worker.join(timeout=3.0)
 
@@ -216,22 +231,23 @@ class RobotController:
                 log.error(f"Command failed after {MAX_RETRIES} retries: {cmd.payload}")
                 with self._lock:
                     self._state = ArmState.ERROR
-            
-            # Heartbeat check: if queue is empty, occasionally ping firmware
-            if self._q.empty() and not self._dry_run:
+            else:
+                # Record the time of last successful transmission for heartbeat
+                self._last_tx_t = time.monotonic()
+
+            # Heartbeat: fire if no successful TX in the last 5 seconds
+            if not self._dry_run:
                 self._do_heartbeat()
 
             self._q.task_done()
 
     def _do_heartbeat(self) -> None:
-        """Send a no-op ping to check connection health."""
+        """Send a no-op ping if no command has been sent in the last 5 seconds."""
         now = time.monotonic()
-        if not hasattr(self, "_last_hb_t"): self._last_hb_t = now
-        
-        if (now - self._last_hb_t) > 5.0:  # every 5 seconds
+        if (now - self._last_tx_t) > 5.0:
             try:
                 self._send_raw({"cmd": "ping"})
-                self._last_hb_t = now
+                self._last_tx_t = now
             except Exception:
                 log.error("Heartbeat failed — connection lost?")
                 with self._lock:
@@ -277,34 +293,55 @@ class RobotController:
             log.error(f"Serial error: {e}")
             return False
 
+    def get_status(self) -> dict:
+        """Thread-safe snapshot of controller state."""
+        with self._lock:
+            state_name = self._state.name
+        return {
+            "state":   state_name,
+            "angles":  self._current_angles,
+            "q_depth": self._q.qsize(),
+        }
+
     # ── Public API ────────────────────────────────────────────────────────────
     def move_to(
         self,
-        angles:   JointAngles,
-        speed:    Optional[int] = None,
-        blocking: bool = False,
+        angles:       JointAngles,
+        speed:        Optional[int] = None,
+        blocking:     bool = False,
+        deadband_deg: float = 0.2,
     ) -> None:
         """
-        Queue a joint-angle move.
+        Queue a joint-angle move.  Skips no-op commands within `deadband_deg`
+        of the last sent position to prevent micro-jitter queue flooding.
 
         Args:
-            angles:   Target joint angles.
-            speed:    0-100 (firmware interprets as motor speed).
-            blocking: If True, wait until queue is empty after pushing.
+            angles:       Target joint angles.
+            speed:        0-100 (firmware interprets as motor speed).
+            blocking:     If True, wait until queue is empty after pushing.
+            deadband_deg: Skip if all joint deltas are smaller than this (deg).
         """
         if not self.is_connected:
             log.error("Not connected."); return
+
+        # Dead-band deduplication — avoids micro-jitter commands during servoing
+        if self._last_sent_angles is not None:
+            deltas = self._last_sent_angles.delta_to(angles)
+            if all(d < deadband_deg for d in deltas):
+                return
 
         payload = {
             "cmd":    "move",
             "angles": [round(a, 1) for a in angles.as_list()],
             "speed":  speed or config.robotics.move_speed,
         }
+        self._last_sent_angles = angles
         self._q.put(_Command(payload))
         self._current_angles = angles   # optimistic update
 
         if blocking:
             self._q.join()
+
 
     def home(self, speed: Optional[int] = None, blocking: bool = True) -> None:
         log.info("Homing ...")

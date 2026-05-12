@@ -162,6 +162,19 @@ class ArmPipeline:
         self._active_task: Optional[RobotTask]           = None
         self._interrupt:   bool                          = False
 
+        # ── Thread-safety: frame cache ──────────────────────────────────────────
+        # cv2.VideoCapture is NOT thread-safe. The vision thread is the ONLY
+        # thread that ever calls _cap.read(). The control thread (visual
+        # servoing) reads from these cached copies under _frame_lock.
+        self._frame_lock:        threading.Lock                = threading.Lock()
+        self._latest_frame:      Optional[np.ndarray]          = None
+        self._latest_detections: list                          = []
+
+        # ── Thread-safety: target coordinate lock ───────────────────────────
+        # target_xyz in _current_task is written by the vision loop and read by
+        # the control loop. Any numpy array assignment is NOT atomic — guard it.
+        self._xyz_lock: threading.Lock = threading.Lock()
+
     # ── Setup ─────────────────────────────────────────────────────────────────
     def setup(self) -> None:
         log.info("=" * 64)
@@ -322,6 +335,12 @@ class ArmPipeline:
                 else:
                     seg.world_xyz = self._mapper.map(*seg.center_px, depth_map)
 
+            # Publish enriched frame + detections (world_xyz populated) for the
+            # control thread. Done AFTER pose estimation so servoing gets 3-D data.
+            with self._frame_lock:
+                self._latest_frame      = frame
+                self._latest_detections = list(result.segmentations)
+
             # 4. Decide (Tracker runs inside decision engine)
             task = self._decision.decide(result.segmentations, frame.shape[0]*frame.shape[1], frame=frame)
 
@@ -334,10 +353,12 @@ class ArmPipeline:
                     try:
                         self._task_queue.put_nowait(task)
                     except queue.Full:
-                        # Update current task XYZ if we are in approach/servo
+                        # Update current task XYZ atomically so the control thread
+                        # never reads a half-written numpy array.
                         with self._task_lock:
                             if self._current_task and self._current_task.track_id == task.track_id:
-                                self._current_task.target_xyz = task.target_xyz
+                                with self._xyz_lock:
+                                    self._current_task.target_xyz = task.target_xyz.copy()
 
             # 6. Visualise
             if config.debug_video:
@@ -366,7 +387,7 @@ class ArmPipeline:
                 time.sleep(1.0)
                 continue
 
-            # 2. Fetch new task if IDLE
+            # 2. Fetch new task if IDLE — block on the queue instead of busy-spinning
             if self._task_state == TaskState.IDLE:
                 try:
                     task = self._task_queue.get(timeout=0.2)
@@ -377,7 +398,7 @@ class ArmPipeline:
                     self._task_state = TaskState.PLANNING
                     self._abort_flag = False
                 except queue.Empty:
-                    pass
+                    continue  # stay IDLE, no sleep wasted
             if self._interrupt:
                 log.warning("[control] Interrupt received — aborting current state.")
                 self._task_state = TaskState.ABORTING
@@ -403,7 +424,10 @@ class ArmPipeline:
                 log.error(f"[control] Error in state {self._task_state}: {e}")
                 self._task_state = TaskState.ABORTING
 
-            time.sleep(0.01)
+            # Yield CPU briefly only during active motion states, not when IDLE
+            # (IDLE blocking is already handled by queue.get(timeout=0.2) above)
+            if self._task_state != TaskState.IDLE:
+                time.sleep(0.01)
 
         log.info("[control] thread stopped")
 
@@ -413,10 +437,18 @@ class ArmPipeline:
         task = self._active_task
         ik = self._ik
         
+        with self._xyz_lock:
+            target_xyz_copy = task.target_xyz.copy() if task.target_xyz is not None else None
+
+        if target_xyz_copy is None:
+            log.warning("[planning] target_xyz is None — aborting.")
+            self._task_state = TaskState.ABORTING
+            return
+
         start_xyz = ik.forward(self._current_ja)
         if start_xyz is None: start_xyz = np.array([0.0, 0.15, 0.15])
-        
-        lift_xyz = task.target_xyz.copy()
+
+        lift_xyz = target_xyz_copy.copy()
         lift_xyz[2] += 0.08
 
         if config.path_planning.enabled:
@@ -453,15 +485,12 @@ class ArmPipeline:
         task = self._active_task
         
         def get_obs():
-            if hasattr(self._depth_est, "get_frames"):
-                raw, _ = self._depth_est.get_frames()
-            else:
-                ret, raw = self._cap.read()
-                if not ret: return None
-            fr = self._pre.process(raw)
-            res = self._segmentor.segment(fr)
-            objs = [s for s in res.segmentations if s.class_name == task.class_name]
-            if not objs: return None
+            """Read the latest detection cache — never touches the camera directly."""
+            with self._frame_lock:
+                detections = list(self._latest_detections)
+            objs = [s for s in detections if s.class_name == task.class_name]
+            if not objs:
+                return None
             best = max(objs, key=lambda o: o.confidence)
             return (best.center_px[0], best.center_px[1], best.area_px)
 
@@ -475,7 +504,12 @@ class ArmPipeline:
 
     def _state_picking(self) -> None:
         task = self._active_task
-        angles = self._ik.solve(task.target_xyz, wrist_pitch_deg=-90, current=self._current_ja)
+        with self._xyz_lock:
+            target_xyz = task.target_xyz.copy() if task.target_xyz is not None else None
+        if target_xyz is None:
+            self._task_state = TaskState.ABORTING
+            return
+        angles = self._ik.solve(target_xyz, wrist_pitch_deg=-90, current=self._current_ja)
         if angles:
             self._ctrl.move_to(angles, blocking=True)
             self._ctrl.grip(close=True)
