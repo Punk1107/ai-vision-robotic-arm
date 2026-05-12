@@ -1,8 +1,10 @@
 # AI Vision Robotic Arm
 
 A Python project for a camera-guided 4-DOF robotic arm. The system combines
-YOLOv8/YOLOv8-Seg vision, object tracking, task planning, inverse kinematics,
-trajectory generation, and serial control for pick-and-place or sorting demos.
+YOLOv8-Seg instance segmentation, Kalman-smoothed object tracking, AI task
+planning, analytical + numerical inverse kinematics, RRT* path planning,
+S-curve trajectory generation, ZV/ZVD input shaping, and real-time AI resonance
+estimation for pick-and-place or sorting demonstrations.
 
 The code is designed to run in dry-run mode without hardware, then switch to a
 real Arduino-controlled arm once calibration and serial settings are ready.
@@ -19,17 +21,19 @@ real Arduino-controlled arm once calibration and serial settings are ready.
 - [Usage](#usage)
 - [Testing](#testing)
 - [Key Modules](#key-modules)
+- [Input Shaping System](#input-shaping-system)
 - [Calibration](#calibration)
 
 ## Overview
 
 The main runtime is `src/main.py`. It starts two cooperating threads:
 
-1. Vision thread: reads camera frames, preprocesses them, runs instance
+1. **Vision thread**: reads camera frames, preprocesses them, runs instance
    segmentation, estimates grasp pose and XYZ coordinates, tracks objects, and
    asks the decision engine for the next task.
-2. Control thread: consumes `RobotTask` objects, plans an approach path, solves
-   inverse kinematics, moves the arm, grips/releases, and returns home.
+2. **Control thread**: consumes `RobotTask` objects, plans an approach path,
+   solves inverse kinematics, applies trajectory smoothing and input shaping,
+   moves the arm, grips/releases, and returns home.
 
 The task queue is intentionally small so old targets do not pile up while the
 physical arm is moving.
@@ -47,10 +51,15 @@ graph TD
     Queue --> Planner[RRTStarPlanner]
     Planner --> IK[IKSolver]
     IK --> Servo[VisualServoController optional]
-    Servo --> Control[RobotController]
-    IK --> Control
+    IK --> TrajPlanner[SCurvePlanner / JerkLimitedPlanner]
+    TrajPlanner --> Shaper[ZV / ZVD / EI Shaper]
+    Shaper --> Control[RobotController]
+    Servo --> Control
     Control --> Arduino[Arduino serial firmware]
     Arduino --> Arm[4-DOF servo arm]
+    Arduino --> IMU[IMU telemetry]
+    IMU --> Estimator[ResonanceEstimator EKF]
+    Estimator --> Shaper
 ```
 
 ### Runtime Data Flow
@@ -64,7 +73,9 @@ graph TD
 | 5 | Tracks | `RobotTask` | `src/logic/decision.py` |
 | 6 | Start/goal XYZ | Cartesian waypoints | `src/robotics/path_planning.py` |
 | 7 | Target XYZ | `JointAngles` | `src/robotics/kinematics.py` |
-| 8 | Joint angles | Serial JSON commands | `src/robotics/control.py` |
+| 8 | Joint angles | Smooth trajectory | `src/robotics/trajectory.py` |
+| 9 | Trajectory | Vibration-suppressed trajectory | `src/robotics/shaping.py` |
+| 10 | Shaped trajectory | Serial JSON commands | `src/robotics/control.py` |
 
 See [docs/architecture.md](docs/architecture.md) for a fuller architecture note.
 
@@ -103,51 +114,62 @@ See [docs/architecture.md](docs/architecture.md) for a fuller architecture note.
 
 ### Robotics
 
-- Analytical IK for the 4-DOF arm.
-- SLSQP numerical IK fallback.
-- Joint limit clamping and singularity warnings.
-- Cartesian RRT* path planning with optional smoothing.
-- Cubic spline and trapezoidal joint-space trajectory planners.
-- Non-blocking serial command queue with retry logic.
+- Analytical IK for the 4-DOF arm with SLSQP numerical fallback.
+- Joint limit clamping and singularity warnings via Jacobian condition number.
+- Dynamic interception: predict and intercept moving objects with velocity regression.
+- Cartesian RRT* path planning with greedy shortcutting smoothing.
+- **Stage 1 — S-curve trajectory**: full 7-phase quintic S-curve with jerk limiting,
+  plus jerk-limited and cubic-spline planners (all config-selectable).
+- **Stage 2 — Input shaping**: ZV, ZVD, and EI shapers suppress residual vibration
+  by convolving the trajectory with timed impulse sequences.
+- **Stage 3 — Adaptive shaping**: EKF-based `ResonanceEstimator` continuously
+  updates ωₙ and ζ from IMU telemetry, allowing the shaper to self-tune as the
+  arm's configuration and payload change.
+- Non-blocking serial command queue with retry logic and heartbeat.
 - Dry-run mode for development without hardware.
+- Optional closed-loop Image-Based Visual Servoing (IBVS) with three-axis PID.
 
 ## Project Layout
 
 ```text
 ai robotic arm/
-  config.yaml
+  config.yaml               ← all tuneable settings including input_shaping
   README.md
   requirements.txt
   setup.cfg
   data/
     dataset.yaml
   docs/
-    architecture.md
-    ik_derivation.md
+    architecture.md         ← full system architecture
+    ik_derivation.md        ← IK math derivation
   notebooks/
     01_exploration.ipynb
   scripts/
     calibrate_camera.py
     evaluate_accuracy.py
     hand_eye_calibration.py
+    measure_resonance.py    ← NEW: empirical ωₙ/ζ measurement tool
     test_vision.py
-    arduino/arm_firmware/arm_firmware.ino
+    arduino/
+      arm_firmware/arm_firmware.ino
   src/
-    main.py
+    main.py                 ← dual-thread pipeline + shaping stack init
     logic/
       decision.py
       quality_control.py
     robotics/
+      ai_estimator.py       ← NEW: FFT / RLS / EKF resonance estimators
       calibration.py
-      control.py
+      control.py            ← v3: IMU telemetry + shaper injection
       kinematics.py
       path_planning.py
-      trajectory.py
+      shaping.py            ← NEW: ZVShaper / ZVDShaper / EIShaper / AdaptiveShaper
+      trajectory.py         ← v2: SCurvePlanner / JerkLimitedPlanner + acc[] field
       visual_servo.py
     ros/
       ai_robotic_arm_ros/arm_node.py
     utils/
-      config.py
+      config.py             ← includes InputShapingConfig dataclass
       logger.py
     vision/
       depth.py
@@ -160,7 +182,7 @@ ai robotic arm/
     test_decision.py
     test_kinematics.py
     test_tracker.py
-    test_trajectory.py
+    test_trajectory.py      ← 45 tests: planners, shapers, estimators
 ```
 
 ## Hardware
@@ -170,10 +192,11 @@ ai robotic arm/
 | Robot arm | 4-DOF servo arm with gripper |
 | Controller | Arduino-compatible board with USB serial |
 | Camera | USB camera, 720p recommended |
-| Host | Python environment with OpenCV and PyTorch |
+| Host | Python 3.10+ with OpenCV and PyTorch |
 | Depth sensor | Optional RealSense D4xx or monocular MiDaS |
+| IMU | Optional MPU-6050 at end-effector (enables Stage 3 adaptive shaping) |
 
-Default arm dimensions in `src/utils/config.py`:
+Default arm dimensions in `config.yaml`:
 
 | Link | Default length |
 | --- | --- |
@@ -182,8 +205,7 @@ Default arm dimensions in `src/utils/config.py`:
 | L3 forearm | 0.090 m |
 | L4 wrist to gripper tip | 0.060 m |
 
-Measure your physical arm and update `config.yaml` or `src/utils/config.py`
-defaults before running on real hardware.
+Measure your physical arm and update `config.yaml` before running on real hardware.
 
 ## Installation
 
@@ -210,23 +232,38 @@ cp .env.example .env
 
 ## Configuration
 
-Most runtime settings live in `config.yaml`.
+All runtime settings live in `config.yaml`. Sections:
 
-Important settings:
+| Section | Purpose |
+| --- | --- |
+| `camera` | OpenCV device index, resolution, fps |
+| `yolo` | Model path, confidence, class filter, input size |
+| `robotics` | Serial port, link lengths, speed, workspace bounds |
+| `depth` | Depth backend and monocular depth calibration |
+| `segmentation` | Seg model, frame skip, min mask area |
+| `grasp_pose` | Pose confidence and depth-noise thresholds |
+| `path_planning` | RRT* enable, iterations, step size, smoothing |
+| `visual_servo` | Closed-loop PID gains and convergence thresholds |
+| `quality_control` | Defect inspection settings and reject zone |
+| `input_shaping` | **NEW** — planner, shaper kind, ωₙ, ζ, Stage 3 adaptive toggle |
+
+Key `input_shaping` settings:
 
 | Key | Purpose |
 | --- | --- |
-| `camera.device_id` | OpenCV camera index |
-| `yolo.model_path` | Custom detection model path |
-| `segmentation.model_path` | Custom segmentation model path |
-| `robotics.serial_port` | Arduino serial port, such as `COM3` |
-| `depth.enabled` | Enables depth estimation backend |
-| `path_planning.enabled` | Enables RRT* approach planning |
-| `visual_servo.enabled` | Enables closed-loop visual servoing |
-| `quality_control.enabled` | Enables defect inspection |
-| `dry_run` | Simulates serial commands when true |
+| `planner` | `s_curve` \| `jerk_limited` \| `cubic` \| `trapezoidal` |
+| `profile` | `quintic` \| `sigmoid` \| `cubic` (for `jerk_limited` only) |
+| `max_vel` | Maximum joint velocity (deg/s) |
+| `max_acc` | Maximum joint acceleration (deg/s²) |
+| `max_jerk` | Maximum joint jerk (deg/s³, S-curve only) |
+| `shaper_kind` | `zvd` \| `zv` \| `ei` \| `none` |
+| `omega_n` | Arm natural frequency in rad/s — **measure with `measure_resonance.py`** |
+| `zeta` | Damping ratio (0–1) |
+| `adaptive` | `true` to enable Stage 3 AI adaptive shaping |
+| `estimator_kind` | `kalman` \| `rls` \| `fft` (Kalman recommended) |
+| `imu_sample_rate` | Firmware IMU output rate in Hz |
 
-Environment variables supported by `src/utils/config.py`:
+Environment variables:
 
 ```dotenv
 ROBOT_SERIAL_PORT=COM3
@@ -254,11 +291,18 @@ Pick mode on a custom serial port:
 python -m src.main --mode pick --port COM5
 ```
 
+Measure arm resonance frequency (needed to tune the ZVD shaper):
+
+```bash
+python -m scripts.measure_resonance --joint base --dry
+python -m scripts.measure_resonance --joint base --update-config
+```
+
 Useful CLI options:
 
 | Option | Meaning |
 | --- | --- |
-| `--mode sort|pick` | Selects task mode |
+| `--mode sort\|pick` | Selects task mode |
 | `--frame-skip N` | Runs segmentation every N frames |
 | `--dry` | Simulates serial commands |
 | `--port PORT` | Overrides configured serial port |
@@ -270,7 +314,7 @@ Stop with `q` in the video window or `Ctrl+C` in the terminal.
 
 ## Testing
 
-Run the suite:
+Run the full suite:
 
 ```bash
 python -m pytest -q
@@ -285,21 +329,63 @@ python -m pytest -q
 
 Current test areas:
 
-| Test file | Coverage |
-| --- | --- |
-| `tests/test_kinematics.py` | Forward/analytical IK, Jacobian, safety, reachability |
-| `tests/test_tracker.py` | Track registration, pruning, smoothing, confidence |
-| `tests/test_trajectory.py` | Cubic and trapezoidal trajectory planners |
-| `tests/test_decision.py` | Task selection, bin routing, filtering, stats |
+| Test file | Coverage | Count |
+| --- | --- | --- |
+| `tests/test_kinematics.py` | Forward/analytical IK, Jacobian, safety, reachability | — |
+| `tests/test_tracker.py` | Track registration, pruning, smoothing, confidence | — |
+| `tests/test_trajectory.py` | All planners, ZV/ZVD/EI shapers, FFT/RLS/Kalman estimators | 45 |
+| `tests/test_decision.py` | Task selection, bin routing, filtering, stats | — |
 
 ## Key Modules
 
-### `src/vision/segmentation.py`
+### `src/robotics/trajectory.py`
 
 ```python
-segmentor = InstanceSegmentor(frame_skip=3)
-result = segmentor.segment(frame)
-best = result.best()
+from src.robotics.trajectory import SCurvePlanner, JerkLimitedPlanner
+
+# S-curve with full jerk limiting (recommended)
+planner = SCurvePlanner(max_vel_deg_s=120, max_acc_deg_s2=200, max_jerk_deg_s3=800)
+traj = planner.plan(start_angles, end_angles)
+
+# Jerk-limited quintic ease-in/out (lighter CPU)
+planner = JerkLimitedPlanner(profile="quintic")
+traj = planner.plan(start_angles, end_angles)
+```
+
+### `src/robotics/shaping.py`
+
+```python
+from src.robotics.shaping import build_shaper
+
+shaper = build_shaper(kind="zvd", omega_n_rad_s=18.0, zeta=0.10)
+shaped_traj = shaper.apply(traj)
+ctrl.play_trajectory(shaped_traj)
+```
+
+### `src/robotics/ai_estimator.py`
+
+```python
+from src.robotics.ai_estimator import ResonanceEstimator, IMUSample
+
+estimator = ResonanceEstimator(sample_rate_hz=200.0, omega_n_init=18.0)
+# In IMU callback:
+estimator.update(IMUSample.from_dict(firmware_resp["imu"]))
+omega_n, zeta = estimator.get_estimate()
+```
+
+### `src/robotics/control.py`
+
+```python
+from src.robotics.shaping import build_shaper
+from src.robotics.ai_estimator import ResonanceEstimator
+
+shaper    = build_shaper(kind="zvd")
+estimator = ResonanceEstimator()
+
+with RobotController(shaper=shaper, estimator=estimator) as ctrl:
+    ctrl.home()
+    ctrl.play_trajectory(traj)   # shaping applied automatically
+    ctrl.grip(close=True)
 ```
 
 ### `src/logic/decision.py`
@@ -316,14 +402,65 @@ ik = IKSolver(elbow_up=True)
 angles = ik.solve(np.array([0.12, 0.20, 0.05]), wrist_pitch_deg=-90)
 ```
 
-### `src/robotics/control.py`
+## Input Shaping System
 
-```python
-with RobotController() as ctrl:
-    ctrl.home()
-    ctrl.move_to(angles, blocking=True)
-    ctrl.grip(close=True)
+The input shaping system has three independently useful stages. You can use any
+combination; all settings are in `config.yaml → input_shaping`.
+
+### Stage 1 — Smooth Trajectory Profiles
+
+The arm moves along a **quintic S-curve** (10τ³−15τ⁴+6τ⁵) that guarantees
+zero velocity *and* zero acceleration at both endpoints. This eliminates the
+infinite-jerk steps present in a raw trapezoidal profile, dramatically reducing
+servo stress and oscillation even without a hardware IMU.
+
+| Planner | Continuity | Best for |
+| --- | --- | --- |
+| `s_curve` | C2 (pos + vel + acc) | All moves; fully jerk-limited |
+| `jerk_limited` | C2 with pluggable profile | Drop-in upgrade; lower CPU |
+| `cubic` | C1 (pos + vel) via scipy spline | Multi-waypoint paths |
+| `trapezoidal` | C0 (legacy) | Backward compatibility only |
+
+### Stage 2 — Classical Input Shaping (ZV / ZVD / EI)
+
+Post-processes the trajectory by convolving it with a sequence of timed
+impulses chosen to cancel the arm's residual vibration at its natural frequency
+ωₙ. The arm must be modelled as a second-order system:
+
 ```
+ẍ + 2ζωₙẋ + ωₙ²x = u(t)
+```
+
+| Shaper | Impulses | Robustness |
+| --- | --- | --- |
+| ZV | 2 | Exact at modelled ωₙ — sensitive to parameter error |
+| ZVD | 3 | Zeroes vibration derivative — robust to ±10 % ωₙ error |
+| EI | 3 | Extra-insensitive — widest tolerance band for uncertain payloads |
+
+To tune ωₙ and ζ for your arm:
+
+```bash
+python -m scripts.measure_resonance --joint base --update-config
+```
+
+### Stage 3 — AI Adaptive Shaping
+
+Connects an on-arm IMU (e.g. MPU-6050 wired through Arduino firmware) to an
+Extended Kalman Filter that continuously estimates ωₙ and ζ in real-time. The
+`AdaptiveShaper` hot-swaps the impulse sequence between moves as the arm's
+resonance changes with extension and payload.
+
+Enable in `config.yaml`:
+
+```yaml
+input_shaping:
+  adaptive:        true
+  estimator_kind:  kalman
+  imu_sample_rate: 200.0
+```
+
+The firmware must include `"imu": {"ax":…, "ay":…, "az":…}` in its serial
+telemetry JSON for the estimator to receive data.
 
 ## Calibration
 
@@ -339,7 +476,7 @@ Generate camera intrinsics:
 python scripts/calibrate_camera.py
 ```
 
-For camera-to-robot alignment, use:
+For camera-to-robot alignment:
 
 ```bash
 python scripts/hand_eye_calibration.py
@@ -351,8 +488,11 @@ Evaluate accuracy:
 python scripts/evaluate_accuracy.py --points 5
 ```
 
-The evaluator can produce a Markdown accuracy report when calibration and
-hardware are available.
+Measure arm resonance (write result directly to `config.yaml`):
+
+```bash
+python -m scripts.measure_resonance --joint base --update-config
+```
 
 ## Notes
 
@@ -361,8 +501,10 @@ hardware are available.
 - The default detection model falls back to `yolov8n.pt` if no custom model
   exists.
 - RealSense support requires `pyrealsense2`, which is intentionally optional.
-- ROS 2 support lives under `src/ros`, but the main Python pipeline can run
+- ROS 2 support lives under `src/ros`, but the main Python pipeline runs
   without ROS.
+- Stage 3 adaptive shaping requires an IMU on the arm and firmware support.
+  Stages 1 and 2 work with no additional hardware.
 
 ## License
 
