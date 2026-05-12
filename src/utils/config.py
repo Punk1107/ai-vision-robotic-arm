@@ -139,6 +139,43 @@ class QualityControlConfig:
 
 
 @dataclass
+class InputShapingConfig:
+    """
+    Input shaping / pulse shaping configuration (Stages 1–3).
+
+    Stage 1 — trajectory profile
+      planner: "cubic" | "jerk_limited" | "s_curve"
+      profile: (for jerk_limited only) "quintic" | "sigmoid" | "cubic"
+
+    Stage 2 — ZV/ZVD/EI shaper
+      shaper_kind:  "zv" | "zvd" | "ei" | "none"
+      omega_n:      natural frequency of the arm (rad/s)  — measure empirically
+      zeta:         damping ratio (0 < ζ < 1)
+
+    Stage 3 — AI adaptive shaping
+      adaptive:         true to enable the AdaptiveShaper wrapper
+      estimator_kind:   "kalman" | "rls" | "fft"  (Kalman recommended)
+      imu_sample_rate:  IMU sample rate from firmware (Hz)
+    """
+    # Stage 1
+    planner:        str   = "s_curve"    # s_curve | jerk_limited | cubic | trapezoidal
+    profile:        str   = "quintic"    # quintic | sigmoid | cubic (jerk_limited only)
+    max_vel:        float = 120.0        # deg/s
+    max_acc:        float = 200.0        # deg/s²
+    max_jerk:       float = 800.0        # deg/s³  (s_curve only)
+
+    # Stage 2
+    shaper_kind:    str   = "zvd"        # zv | zvd | ei | none
+    omega_n:        float = 18.0         # rad/s  (≈ 2.9 Hz — typical hobby arm)
+    zeta:           float = 0.10         # damping ratio
+
+    # Stage 3
+    adaptive:       bool  = False        # enable AdaptiveShaper
+    estimator_kind: str   = "kalman"     # kalman | rls | fft
+    imu_sample_rate: float = 200.0       # Hz (match firmware IMU output rate)
+
+
+@dataclass
 class AppConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
     yolo: YOLOConfig = field(default_factory=YOLOConfig)
@@ -149,6 +186,7 @@ class AppConfig:
     path_planning: PathPlanningConfig = field(default_factory=PathPlanningConfig)
     visual_servo: VisualServoConfig = field(default_factory=VisualServoConfig)
     quality_control: QualityControlConfig = field(default_factory=QualityControlConfig)
+    input_shaping: InputShapingConfig = field(default_factory=InputShapingConfig)
 
     log_level: str = "INFO"
     log_dir: str = str(ROOT / "logs")
@@ -199,6 +237,7 @@ def load_config(config_path: Optional[Path] = None) -> AppConfig:
             "path_planning",
             "visual_servo",
             "quality_control",
+            "input_shaping",
         ):
             if section := data.get(section_name):
                 target = getattr(cfg, section_name)

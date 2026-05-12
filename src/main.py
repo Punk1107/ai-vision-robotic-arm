@@ -43,6 +43,11 @@ from src.robotics.kinematics   import IKSolver, JointAngles, DynamicInterceptor
 from src.robotics.control      import RobotController
 from src.robotics.path_planning import RRTStarPlanner
 from src.robotics.visual_servo  import VisualServoController
+from src.robotics.shaping       import build_shaper, ZVDShaper
+from src.robotics.ai_estimator  import ResonanceEstimator
+from src.robotics.trajectory    import (
+    SCurvePlanner, JerkLimitedPlanner, CubicSplinePlanner, TrapezoidalPlanner
+)
 
 from src.logic.decision import DecisionEngine, RobotTask, TaskType
 
@@ -145,6 +150,9 @@ class ArmPipeline:
         self._servo:       Optional[VisualServoController] = None
         self._interceptor: Optional[DynamicInterceptor]  = None
         self._current_ja:  JointAngles                   = _HOME
+        self._shaper                                     = None
+        self._estimator                                  = None
+        self._traj_planner                               = None
         
         # State machine members
         self._current_task: Optional[RobotTask]          = None
@@ -181,7 +189,62 @@ class ArmPipeline:
         self._pose_est  = GraspPoseEstimator(mapper=self._mapper)
 
         self._ik          = IKSolver(elbow_up=True)
-        self._ctrl        = RobotController()
+
+        # ── Build input shaping stack from config ──────────────────────────────────
+        is_cfg = config.input_shaping
+
+        # Stage 1: select trajectory planner
+        planner_name = is_cfg.planner.lower()
+        if planner_name == "s_curve":
+            self._traj_planner = SCurvePlanner(
+                max_vel_deg_s=is_cfg.max_vel,
+                max_acc_deg_s2=is_cfg.max_acc,
+                max_jerk_deg_s3=is_cfg.max_jerk,
+            )
+        elif planner_name == "jerk_limited":
+            self._traj_planner = JerkLimitedPlanner(
+                max_vel_deg_s=is_cfg.max_vel,
+                max_acc_deg_s2=is_cfg.max_acc,
+                profile=is_cfg.profile,
+            )
+        elif planner_name == "cubic":
+            self._traj_planner = CubicSplinePlanner()
+        else:
+            self._traj_planner = TrapezoidalPlanner(
+                max_vel_deg_s=is_cfg.max_vel,
+                max_acc_deg_s2=is_cfg.max_acc,
+            )
+        log.info(f"Trajectory planner: {self._traj_planner.__class__.__name__}")
+
+        # Stage 3: build resonance estimator (if adaptive mode on)
+        self._estimator = None
+        if is_cfg.adaptive:
+            self._estimator = ResonanceEstimator(
+                sample_rate_hz=is_cfg.imu_sample_rate,
+                omega_n_init=is_cfg.omega_n,
+                zeta_init=is_cfg.zeta,
+            )
+            log.info("Stage 3 — AI Resonance Estimator initialised.")
+
+        # Stage 2: build the shaper (optionally wrapping in AdaptiveShaper)
+        self._shaper = None
+        if is_cfg.shaper_kind.lower() != "none":
+            adaptive_kind = (
+                f"adaptive_{is_cfg.shaper_kind}" if is_cfg.adaptive else is_cfg.shaper_kind
+            )
+            self._shaper = build_shaper(
+                kind=adaptive_kind,
+                omega_n_rad_s=is_cfg.omega_n,
+                zeta=is_cfg.zeta,
+                estimator=self._estimator,
+            )
+            log.info(
+                f"Stage 2 — Shaper: {self._shaper.__class__.__name__} "
+                f"(ωₙ={is_cfg.omega_n:.1f} rad/s  ζ={is_cfg.zeta:.3f})"
+            )
+
+        # ── Build controller with shaping stack ────────────────────────────────────
+        self._ctrl        = RobotController(shaper=self._shaper, estimator=self._estimator)
         self._rrt         = RRTStarPlanner()
         self._servo       = VisualServoController(ik_solver=self._ik)
         self._interceptor = DynamicInterceptor(solver=self._ik)
