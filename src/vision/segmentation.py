@@ -104,38 +104,36 @@ def _pca_orientation(mask: np.ndarray) -> Tuple[Tuple[int, int], float]:
     """
     Compute the centroid and primary axis orientation of a binary mask.
 
+    Uses image moments for O(1) centroid and covariance-via-moments for the
+    principal axis — avoids constructing the full pixel coordinate array.
+
     Args:
         mask: Boolean or uint8 2D array (H, W).
 
     Returns:
         (centroid_xy, orientation_degrees)
-        orientation_degrees: Angle of the major axis from the positive X-axis,
-                             in [0, 180°).
+        orientation_degrees: Angle of the major axis from positive X-axis, [0, 180°).
     """
-    pts = np.column_stack(np.where(mask > 0))   # (N, 2) → row, col
-    if len(pts) < 5:
-        # Degenerate mask — can't compute orientation
-        ys, xs = np.where(mask > 0)
-        cy = int(np.mean(ys)) if len(ys) > 0 else mask.shape[0] // 2
-        cx = int(np.mean(xs)) if len(xs) > 0 else mask.shape[1] // 2
-        return (cx, cy), 0.0
+    m = cv2.moments(mask.astype(np.uint8))
+    area = m["m00"]
 
-    # pts columns: [row=y, col=x] — flip for (x, y) convention
-    xy = pts[:, ::-1].astype(np.float32)   # (N, 2) in (x, y) order
-    mean_xy = xy.mean(axis=0)
+    if area < 5:
+        # Degenerate mask
+        h, w = mask.shape
+        return (w // 2, h // 2), 0.0
 
-    # Covariance matrix
-    centred = xy - mean_xy
-    cov = (centred.T @ centred) / max(len(centred) - 1, 1)
+    cx = int(m["m10"] / area)
+    cy = int(m["m01"] / area)
 
-    # Eigen-decomposition → largest eigenvector = primary axis
-    eigenvalues, eigenvectors = np.linalg.eigh(cov)
-    major_axis = eigenvectors[:, np.argmax(eigenvalues)]  # (2,)
+    # Central moments → covariance matrix
+    mu20 = m["mu20"] / area
+    mu02 = m["mu02"] / area
+    mu11 = m["mu11"] / area
 
-    angle_rad = np.arctan2(major_axis[1], major_axis[0])
-    angle_deg = float(np.degrees(angle_rad)) % 180.0      # keep in [0, 180)
+    # Principal axis angle from covariance
+    angle_rad = 0.5 * np.arctan2(2.0 * mu11, mu20 - mu02)
+    angle_deg = float(np.degrees(angle_rad)) % 180.0
 
-    cx, cy = int(mean_xy[0]), int(mean_xy[1])
     return (cx, cy), angle_deg
 
 
@@ -309,22 +307,25 @@ class InstanceSegmentor:
     ) -> np.ndarray:
         """
         Draw segmentation masks, orientation arrows, and labels on a copy of frame.
+        The mask colour overlay is blended first; labels/arrows are drawn on top
+        so they are not dimmed by the alpha blend.
         """
-        vis = frame.copy()
+        # ── 1. Build coloured mask overlay ────────────────────────────────────
         overlay = frame.copy()
+        for seg in result.segmentations:
+            overlay[seg.mask] = seg.colour()
 
+        # ── 2. Blend mask into vis BEFORE drawing labels/arrows ───────────────
+        vis = cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0)
+
+        # ── 3. Draw per-object labels, boxes, arrows on top of blended vis ────
         for seg in result.segmentations:
             colour  = seg.colour()
             cx, cy  = seg.center_px
 
-            # ── Coloured mask overlay ─────────────────────────────────────────
-            overlay[seg.mask] = colour
-
-            # ── Bounding box ──────────────────────────────────────────────────
             x1, y1, x2, y2 = seg.bbox_xyxy
             cv2.rectangle(vis, (x1, y1), (x2, y2), colour, 2)
 
-            # ── Orientation arrow (primary axis) ──────────────────────────────
             arrow_len = min(50, min(x2 - x1, y2 - y1) // 2)
             angle_rad = np.radians(seg.orientation_deg)
             dx = int(arrow_len * np.cos(angle_rad))
@@ -335,7 +336,6 @@ class InstanceSegmentor:
                 colour, 2, tipLength=0.3,
             )
 
-            # ── Label ─────────────────────────────────────────────────────────
             label = (
                 f"{seg.class_name}  {seg.confidence:.0%}  "
                 f"θ={seg.orientation_deg:.1f}°  "
@@ -348,14 +348,10 @@ class InstanceSegmentor:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA,
             )
 
-            # ── Centroid marker ───────────────────────────────────────────────
             cv2.drawMarker(vis, (cx, cy), colour, cv2.MARKER_STAR, 10, 2)
 
-        # Blend mask overlay
-        cv2.addWeighted(overlay, alpha, vis, 1 - alpha, 0, vis)
-
-        # HUD
-        fps = 1000 / result.inference_ms if result.inference_ms > 0 else 0
+        # ── 4. HUD ─────────────────────────────────────────────────────────────
+        fps = 1000.0 / result.inference_ms if result.inference_ms > 0 else 0.0
         cv2.putText(
             vis,
             f"SEG FPS: {fps:.1f}  |  Objects: {result.count}  [skip={self._frame_skip}]",

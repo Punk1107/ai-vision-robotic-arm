@@ -53,11 +53,18 @@ _H = np.array([           # Measurement model
 _Q = np.eye(4, dtype=np.float32) * 0.03   # process noise
 _R = np.eye(2, dtype=np.float32) * 2.0    # measurement noise
 
+# Pre-built identity matrices reused every frame (avoid repeated allocation)
+_I4 = np.eye(4, dtype=np.float32)
+_I3 = np.eye(3, dtype=np.float32)
+
 # 3D World Filter (X, Y, Z position only)
 _F_3D = np.eye(3, dtype=np.float32)
 _H_3D = np.eye(3, dtype=np.float32)
 _Q_3D = np.eye(3, dtype=np.float32) * 0.001 # lower noise for world coords
 _R_3D = np.eye(3, dtype=np.float32) * 0.01
+
+# Precomputed 3D Kalman denominator (P_xyz + R_3D)^-1 is trivially P/(P+R)
+# since both _H_3D and _F_3D are identity. Cached to avoid per-frame rebuild.
 
 
 @dataclass
@@ -94,21 +101,34 @@ class Track:
 
     def update(self, measurement: np.ndarray, conf: float, world_xyz: Optional[np.ndarray] = None) -> None:
         """Kalman update step with new centroid measurement."""
-        # 2D Update
+        # 2D Update — S is 2×2; use closed-form inverse to avoid LAPACK dispatch
         z = measurement.astype(np.float32)
-        S = _H @ self.kf_P @ _H.T + _R
-        K = self.kf_P @ _H.T @ np.linalg.inv(S)
+        S = _H @ self.kf_P @ _H.T + _R   # 2×2
+        # Closed-form 2×2 inverse: inv([[a,b],[c,d]]) = 1/(ad-bc) * [[d,-b],[-c,a]]
+        det = S[0, 0] * S[1, 1] - S[0, 1] * S[1, 0]
+        if abs(det) < 1e-9:
+            det = 1e-9   # numerical guard
+        S_inv = np.array([
+            [ S[1, 1], -S[0, 1]],
+            [-S[1, 0],  S[0, 0]],
+        ], dtype=np.float32) / det
+        K = self.kf_P @ _H.T @ S_inv
         self.kf_x += K @ (z - _H @ self.kf_x)
-        self.kf_P = (np.eye(4, dtype=np.float32) - K @ _H) @ self.kf_P
-        self.centroid       = self.kf_x[:2].copy()
+        self.kf_P = (_I4 - K @ _H) @ self.kf_P
+        self.centroid = self.kf_x[:2].copy()
 
-        # 3D Update (if world_xyz provided)
+        # 3D Update — since _H_3D = _F_3D = I, the KF reduces to a simple
+        # per-element scalar update. S3 = P_xyz + R_3D (both diagonal).
         if world_xyz is not None:
             z3 = world_xyz.astype(np.float32)
-            S3 = _H_3D @ self.kf_P_xyz @ _H_3D.T + _R_3D
-            K3 = self.kf_P_xyz @ _H_3D.T @ np.linalg.inv(S3)
-            self.kf_xyz += K3 @ (z3 - _H_3D @ self.kf_xyz)
-            self.kf_P_xyz = (np.eye(3, dtype=np.float32) - K3 @ _H_3D) @ self.kf_P_xyz
+            # S3 diagonal: Pii + R_3D_ii; K3 = P / (P + R) (element-wise)
+            s3_diag = np.diag(self.kf_P_xyz) + np.diag(_R_3D)  # (3,)
+            k3_diag = np.diag(self.kf_P_xyz) / np.maximum(s3_diag, 1e-9)  # (3,)
+            innov   = z3 - self.kf_xyz            # (3,)
+            self.kf_xyz   += k3_diag * innov
+            # Joseph form covariance update (numerically stable)
+            self.kf_P_xyz  = ((1 - k3_diag)[:, None] * self.kf_P_xyz
+                              + np.diag((k3_diag ** 2) * np.diag(_R_3D)))
             self.world_xyz = self.kf_xyz.copy()
 
         self.disappeared    = 0

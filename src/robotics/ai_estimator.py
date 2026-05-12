@@ -359,13 +359,26 @@ class KalmanEstimator:
             # Measurement Jacobian H
             H = np.array([[-wn2, -two_zw, -pos_new, -vel_new]])
             S = H @ P_pred @ H.T + self._R
-            K = P_pred @ H.T @ np.linalg.inv(S)   # Kalman gain (1×4)
+            K = P_pred @ H.T * (1.0 / float(S[0, 0]))  # Kalman gain — S is 1×1
 
-            self._x = x_pred + (K @ np.array([[innov]])).flatten()
-            self._P = (np.eye(4) - K @ H) @ P_pred
+            x_new = x_pred + (K @ np.array([[innov]])).flatten()
+
+            # Joseph-form covariance update: (I-KH)P(I-KH)^T + K R K^T
+            # Preserves symmetry and positive-definiteness under numerical noise.
+            IKH     = np.eye(4) - K @ H
+            self._P = IKH @ P_pred @ IKH.T + K * float(self._R[0, 0]) * K.T
+
+            # Enforce symmetry and clamp diagonal to > 0 (prevents collapse)
+            self._P = 0.5 * (self._P + self._P.T)
+            np.fill_diagonal(self._P, np.maximum(np.diag(self._P), 1e-6))
+
+            # Clamp state to physically plausible range after each update
+            x_new[2] = np.clip(x_new[2], self._wmin ** 2, self._wmax ** 2)  # wn²
+            x_new[3] = np.clip(x_new[3], 0.0, 2.0 * self._wmax)             # 2ζω
+            self._x  = x_new
 
             # ── Extract ωₙ, ζ ─────────────────────────────────────────────────
-            wn2_est   = max(0.1, self._x[2])
+            wn2_est    = self._x[2]
             two_zw_est = self._x[3]
             omega_n    = math.sqrt(wn2_est)
             zeta       = two_zw_est / (2.0 * omega_n + 1e-9)

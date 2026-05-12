@@ -263,13 +263,11 @@ class IKSolver:
                          + 0.01 * (math.degrees(q[3]) - wrist_pitch_deg) ** 2)
 
         def _grad(q):
-            eps = 1e-5
-            g   = np.zeros_like(q)
-            f0  = _cost(q)
-            for i in range(len(q)):
-                qe    = q.copy(); qe[i] += eps
-                g[i]  = (_cost(qe) - f0) / eps
-            return g
+            eps   = 1e-5
+            f0    = _cost(q)
+            q_mat = np.tile(q, (len(q), 1)) + np.eye(len(q)) * eps
+            costs = np.array([_cost(qr) for qr in q_mat])
+            return (costs - f0) / eps
 
         result = minimize(
             _cost, x0, jac=_grad,
