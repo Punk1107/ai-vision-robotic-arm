@@ -1,8 +1,14 @@
 """
 preprocess.py — Image Preprocessing Pipeline
 ==============================================
-Camera calibration correction and colour-space helpers
-used upstream of YOLO inference.
+Camera calibration correction, colour-space helpers, and full
+production filter stack integration, used upstream of YOLO inference.
+
+Filter Stack (src.filters):
+    1. Lens undistortion (camera calibration)
+    2. Gaussian denoise  → reduces YOLO false-positives from noise
+    3. CLAHE             → improves detection in low-light conditions
+    4. Optional Bilateral / Median for depth camera preprocessing
 """
 
 from __future__ import annotations
@@ -15,6 +21,12 @@ import cv2
 import numpy as np
 
 from src.utils.logger import get_logger
+
+try:
+    from src.filters.pipeline import FilterPipeline, ImagePreprocessConfig
+    _FILTERS_AVAILABLE = True
+except ImportError:
+    _FILTERS_AVAILABLE = False
 
 log = get_logger("vision.preprocess")
 
@@ -33,10 +45,15 @@ class CameraPreprocessor:
 
     def __init__(
         self,
-        target_width: int  = 640,
-        target_height: int = 480,
-        equalize_hist: bool = False,
-        calib_path: Optional[Path] = None,
+        target_width:  int   = 640,
+        target_height: int   = 480,
+        equalize_hist: bool  = False,
+        calib_path:    Optional[Path] = None,
+        # ── Filter pipeline parameters ─────────────────────────────────────
+        use_gaussian:  bool  = True,    # Gaussian denoise before YOLO
+        gaussian_k:    int   = 5,       # Gaussian kernel size
+        use_bilateral: bool  = False,   # Edge-preserving denoise (slower)
+        use_clahe:     bool  = False,   # Adaptive contrast (low-light)
     ) -> None:
         self.target_size   = (target_width, target_height)
         self.equalize_hist = equalize_hist
@@ -45,6 +62,21 @@ class CameraPreprocessor:
         self._dist_coeffs:   Optional[np.ndarray] = None
         self._map1:          Optional[np.ndarray] = None
         self._map2:          Optional[np.ndarray] = None
+
+        # ── Initialise production filter pipeline ──────────────────────────
+        if _FILTERS_AVAILABLE:
+            cfg = ImagePreprocessConfig(
+                use_gaussian  = use_gaussian,
+                gaussian_ksize = gaussian_k,
+                use_bilateral = use_bilateral,
+                use_median    = False,
+                use_clahe     = use_clahe or equalize_hist,   # CLAHE replaces legacy HE
+            )
+            self._filter_pipeline: Optional[FilterPipeline] = FilterPipeline(cfg)
+            log.info("FilterPipeline active in CameraPreprocessor ✓")
+        else:
+            self._filter_pipeline = None
+            log.warning("src.filters not found — running without production filter stack")
 
         self._load_calibration(calib_path or (_CALIB_DIR / "camera_params.json"))
 
@@ -89,12 +121,16 @@ class CameraPreprocessor:
         # 1. Resize
         out = cv2.resize(frame, self.target_size, interpolation=cv2.INTER_LINEAR)
 
-        # 2. Undistort
+        # 2. Undistort (camera calibration lens correction)
         if self._map1 is not None:
             out = cv2.remap(out, self._map1, self._map2, cv2.INTER_LINEAR)
 
-        # 3. Adaptive histogram equalisation (CLAHE) on luminance
-        if self.equalize_hist:
+        # 3. Production Filter Pipeline (Gaussian + CLAHE + Bilateral)
+        #    Replaces legacy manual CLAHE — FilterPipeline handles all stages
+        if self._filter_pipeline is not None:
+            out = self._filter_pipeline.process(out)
+        elif self.equalize_hist:
+            # Legacy fallback: manual CLAHE if filters module not available
             lab   = cv2.cvtColor(out, cv2.COLOR_BGR2LAB)
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             lab[:, :, 0] = clahe.apply(lab[:, :, 0])

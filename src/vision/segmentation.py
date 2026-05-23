@@ -37,6 +37,13 @@ import torch
 from src.utils.config import config
 from src.utils.logger import get_logger
 
+# ── Filter stack integration ──────────────────────────────────────────
+try:
+    from src.filters.morphology import MorphologicalProcessor
+    _MORPH_AVAILABLE = True
+except ImportError:
+    _MORPH_AVAILABLE = False
+
 log = get_logger("vision.segmentation")
 
 _PALETTE = [
@@ -189,6 +196,18 @@ class InstanceSegmentor:
         self._frame_id       = 0
         self._last_result:   Optional[SegmentationResult] = None
 
+        # ── Morphological mask cleaner ─────────────────────────────────────
+        # Cleans raw YOLO masks before PCA orientation + area calculation:
+        #   - Opening (erode then dilate): removes isolated noise pixels
+        #   - Closing (dilate then erode): fills small holes inside mask
+        if _MORPH_AVAILABLE:
+            self._mask_morph = MorphologicalProcessor(
+                open_ksize=3, close_ksize=5, min_area_px=0  # no area filter here (done below)
+            )
+            log.info("InstanceSegmentor: MorphologicalProcessor active ✓")
+        else:
+            self._mask_morph = None
+
         self._warmup()
         log.success("InstanceSegmentor ready ✓")
 
@@ -266,9 +285,8 @@ class InstanceSegmentor:
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(W - 1, x2), min(H - 1, y2)
 
-            # ── Extract mask ──────────────────────────────────────────────────
+            # ── Extract mask ────────────────────────────────────────────────────
             if masks is not None and i < len(masks.data):
-                # masks.data is (N, H_mask, W_mask); resize to frame size
                 mask_raw = masks.data[i].cpu().numpy()
                 mask_resized = cv2.resize(
                     mask_raw, (W, H), interpolation=cv2.INTER_NEAREST
@@ -278,6 +296,12 @@ class InstanceSegmentor:
                 # Fallback: filled bounding box as approximate mask
                 binary_mask = np.zeros((H, W), dtype=np.uint8)
                 binary_mask[y1:y2, x1:x2] = 1
+
+            # ── Morphological mask cleanup ─────────────────────────────────────
+            # Remove noise speckles + fill holes before PCA orientation
+            if self._mask_morph is not None and binary_mask.any():
+                binary_mask = self._mask_morph.process(binary_mask)
+                binary_mask = (binary_mask > 0).astype(np.uint8)  # re-binarise
 
             # ── PCA orientation ───────────────────────────────────────────────
             (cx, cy), orient = _pca_orientation(binary_mask)

@@ -32,6 +32,13 @@ from scipy.optimize import linear_sum_assignment
 from src.vision.detect import Detection
 from src.utils.logger import get_logger
 
+# ── Filter stack integration ──────────────────────────────────────────
+try:
+    from src.filters.signal import EMAFilter
+    _EMA_AVAILABLE = True
+except ImportError:
+    _EMA_AVAILABLE = False
+
 log = get_logger("vision.tracker")
 
 # ── Kalman Filter parameters ──────────────────────────────────────────────────
@@ -89,6 +96,9 @@ class Track:
     # Detection history for temporal consensus
     conf_history:    deque = field(default_factory=lambda: deque(maxlen=10))
 
+    # EMAFilter for smoothed confidence (replaces manual exponential weighting)
+    _conf_ema:       object = field(default=None, init=False, repr=False)
+
     def predict(self) -> None:
         """Kalman predict step (call each frame even if not matched)."""
         # 2D Centroid predict
@@ -138,12 +148,26 @@ class Track:
 
     @property
     def smoothed_confidence(self) -> float:
-        """Exponentially weighted average confidence."""
+        """EMA-smoothed confidence (uses EMAFilter from filters.signal if available)."""
         if not self.conf_history:
             return self.confidence
-        weights = np.exp(np.linspace(-1, 0, len(self.conf_history)))
-        weights /= weights.sum()
-        return float(np.dot(weights, list(self.conf_history)))
+
+        if _EMA_AVAILABLE:
+            # Use EMAFilter with α=0.3 (heavier smoothing for confidence scores)
+            if self._conf_ema is None:
+                # Lazy init: can't use mutable default in dataclass
+                object.__setattr__(self, '_conf_ema', EMAFilter(alpha=0.3, initial_value=self.confidence))
+            # Re-run EMA over full history to get current smoothed value
+            ema = EMAFilter(alpha=0.3, initial_value=list(self.conf_history)[0])
+            result = self.confidence
+            for c in list(self.conf_history):
+                result = ema.update(c)
+            return result
+        else:
+            # Legacy fallback: manual exponential weighting
+            weights = np.exp(np.linspace(-1, 0, len(self.conf_history)))
+            weights /= weights.sum()
+            return float(np.dot(weights, list(self.conf_history)))
 
     @property
     def is_confirmed(self) -> bool:

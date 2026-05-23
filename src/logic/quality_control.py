@@ -45,6 +45,15 @@ import numpy as np
 from src.utils.config import config
 from src.utils.logger import get_logger
 
+# ── Filter stack integration ──────────────────────────────────────────
+try:
+    from src.filters.morphology import MorphologicalProcessor
+    from src.filters.edge import LaplacianFilter
+    from src.filters.image import GaussianFilter, BilateralFilter
+    _FILTERS_AVAILABLE = True
+except ImportError:
+    _FILTERS_AVAILABLE = False
+
 log = get_logger("logic.quality_control")
 
 
@@ -122,10 +131,27 @@ class QualityInspector:
         if ml_model_path and Path(ml_model_path).exists():
             self._load_ml_model(ml_model_path)
 
+        # ── Filter stack for QC preprocessing ─────────────────────────────
+        if _FILTERS_AVAILABLE:
+            # Morphological cleaning of inspection masks
+            self._morph = MorphologicalProcessor(
+                open_ksize=3, close_ksize=5, min_area_px=50
+            )
+            # Improved Laplacian texture variance (LoG variant)
+            self._lap_filter = LaplacianFilter(use_log=True, sigma=1.0)
+            # Bilateral denoise for ROI before colour analysis
+            self._bilateral  = BilateralFilter(d=5, sigma_color=50.0, sigma_space=50.0)
+            log.info("QualityInspector: production filter stack active ✓")
+        else:
+            self._morph       = None
+            self._lap_filter  = None
+            self._bilateral   = None
+
         log.info(
             f"QualityInspector ready | "
             f"defect_thr={defect_threshold:.2f} | "
-            f"ml={'enabled' if self._ml_available else 'disabled'}"
+            f"ml={'enabled' if self._ml_available else 'disabled'} | "
+            f"filters={'enabled' if _FILTERS_AVAILABLE else 'disabled'}"
         )
 
     def _load_ml_model(self, path: Path) -> None:
@@ -165,9 +191,19 @@ class QualityInspector:
         t0    = time.perf_counter()
         notes: List[str] = []
 
-        # ── Extract masked ROI ────────────────────────────────────────────────
+        # ── Extract masked ROI ──────────────────────────────────────────
         mask_u8 = (mask > 0).astype(np.uint8)
-        roi     = cv2.bitwise_and(frame, frame, mask=mask_u8)
+
+        # Apply morphological cleaning to the mask (removes noise before analysis)
+        if self._morph is not None:
+            mask_u8 = self._morph.process(mask_u8)
+            mask_u8 = (mask_u8 > 0).astype(np.uint8)   # re-binarise
+
+        roi = cv2.bitwise_and(frame, frame, mask=mask_u8)
+
+        # Apply bilateral denoise to ROI (preserves edges for better colour analysis)
+        if self._bilateral is not None and mask_u8.any():
+            roi = self._bilateral.apply(roi)
 
         # ── Stage 1: Texture (Laplacian variance) ─────────────────────────────
         tex_score = self._texture_score(roi, mask_u8, notes)
@@ -220,21 +256,21 @@ class QualityInspector:
         notes:  List[str],
     ) -> float:
         gray  = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        lap   = cv2.Laplacian(gray, cv2.CV_64F)
-        # Only measure within mask
-        lap_vals = lap[mask > 0]
-        if len(lap_vals) == 0:
-            return 0.0
 
-        variance = float(np.var(lap_vals))
+        # Use LaplacianFilter (LoG) for improved texture variance if available
+        if self._lap_filter is not None:
+            variance = self._lap_filter.variance(gray)
+        else:
+            # Legacy fallback
+            lap      = cv2.Laplacian(gray, cv2.CV_64F)
+            lap_vals = lap[mask > 0]
+            variance = float(np.var(lap_vals)) if len(lap_vals) > 0 else 0.0
 
         if variance < LAPLACIAN_LOW_THRESH:
             notes.append(f"Low texture variance ({variance:.1f}) → blurry/smooth surface")
-            # Clamp: 0 variance → score 1.0, high variance → score 0.0
-            score = 1.0 - np.clip(variance / LAPLACIAN_LOW_THRESH, 0.0, 1.0)
+            score = 1.0 - np.clip(variance / max(LAPLACIAN_LOW_THRESH, 1e-6), 0.0, 1.0)
         else:
             score = 0.0
-
         return float(score)
 
     # ── Stage 2: Colour uniformity ────────────────────────────────────────────

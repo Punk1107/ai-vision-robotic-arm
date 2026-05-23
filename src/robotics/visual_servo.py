@@ -34,6 +34,14 @@ from src.robotics.kinematics import IKSolver, JointAngles
 from src.utils.config import config
 from src.utils.logger import get_logger
 
+# ── Filter stack integration ──────────────────────────────────────────
+try:
+    from src.filters.control import DerivativeLPF
+    from src.filters.signal import EMAFilter
+    _FILTERS_AVAILABLE = True
+except ImportError:
+    _FILTERS_AVAILABLE = False
+
 log = get_logger("robotics.visual_servo")
 
 
@@ -42,24 +50,38 @@ log = get_logger("robotics.visual_servo")
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _PID:
-    """Simple discrete PID with anti-windup clamp."""
+    """Simple discrete PID with anti-windup clamp and dirty-derivative LPF."""
 
     def __init__(
         self,
         kp: float,
         ki: float,
         kd: float,
-        out_min: float = -0.05,
-        out_max: float =  0.05,
+        out_min:    float = -0.05,
+        out_max:    float =  0.05,
+        d_cutoff_hz: float = 10.0,   # Derivative LPF cutoff
+        sample_rate: float = 30.0,   # Visual servo loop rate
     ) -> None:
         self.kp = kp; self.ki = ki; self.kd = kd
         self._out_min = out_min; self._out_max = out_max
         self._integral   = 0.0
         self._prev_error = 0.0
 
+        # ── Dirty derivative LPF (from filter stack) ─────────────────────
+        # Replaces the raw finite-difference derivative to eliminate
+        # high-frequency noise amplification in the D-term.
+        if _FILTERS_AVAILABLE and kd > 0:
+            self._d_lpf: DerivativeLPF | None = DerivativeLPF(
+                kd=kd, cutoff_hz=d_cutoff_hz, sample_rate_hz=sample_rate
+            )
+        else:
+            self._d_lpf = None
+
     def reset(self) -> None:
         self._integral   = 0.0
         self._prev_error = 0.0
+        if self._d_lpf is not None:
+            self._d_lpf.reset()
 
     def step(self, error: float, dt: float) -> float:
         self._integral += error * dt
@@ -69,10 +91,16 @@ class _PID:
             self._out_min / (self.ki + 1e-9),
             self._out_max / (self.ki + 1e-9),
         )
-        derivative      = (error - self._prev_error) / max(dt, 1e-6)
-        self._prev_error = error
 
-        out = self.kp * error + self.ki * self._integral + self.kd * derivative
+        # D-term: use production DerivativeLPF if available, else raw diff
+        if self._d_lpf is not None:
+            d_out = self._d_lpf.update(error, dt)
+        else:
+            derivative      = (error - self._prev_error) / max(dt, 1e-6)
+            self._prev_error = error
+            d_out = self.kd * derivative
+
+        out = self.kp * error + self.ki * self._integral + d_out
         return float(np.clip(out, self._out_min, self._out_max))
 
 
