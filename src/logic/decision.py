@@ -25,6 +25,13 @@ from src.vision.tracker import Track, CentroidTracker
 from src.utils.config import config
 from src.utils.logger import get_logger
 
+# ── Filter stack integration ──────────────────────────────────────────
+try:
+    from src.filters.signal import EMAFilter
+    _EMA_AVAILABLE = True
+except ImportError:
+    _EMA_AVAILABLE = False
+
 log = get_logger("logic.decision")
 
 
@@ -170,6 +177,10 @@ class DecisionEngine:
         # Persistent memory for picked tracks (track_id -> expiration_time)
         self._picked_history: Dict[int, float] = {}
 
+        # Per-track EMA score smoother (track_id -> EMAFilter)
+        # Prevents brief occlusions or confidence dips from flipping pick priority
+        self._score_ema: Dict[int, object] = {} if _EMA_AVAILABLE else {}
+
         log.info(
             f"Intelligent Task Planner v3 | mode={mode.upper()} "
             f"| confirm={confirm_frames} frames "
@@ -296,8 +307,16 @@ class DecisionEngine:
             cent_dist  = np.linalg.norm(t.centroid - np.array([cx_frame, cy_frame]))
             prox_bonus = 1.0 / (1.0 + cent_dist / 300.0)
             
-            # Final score weighting
-            score = (sem_priority * 1000) + (t.smoothed_confidence * 100) + (age_bonus * 30) + (prox_bonus * 10)
+            # Raw score
+            raw_score = (sem_priority * 1000) + (t.smoothed_confidence * 100) + (age_bonus * 30) + (prox_bonus * 10)
+
+            # EMA-smooth the score per track to prevent priority flipping on noise
+            if _EMA_AVAILABLE:
+                if t.track_id not in self._score_ema:
+                    self._score_ema[t.track_id] = EMAFilter(alpha=0.4, initial_value=raw_score)
+                score = self._score_ema[t.track_id].update(raw_score)
+            else:
+                score = raw_score
             scored_candidates.append((score, t))
             
         # Sort highest score first

@@ -193,7 +193,11 @@ class ArmPipeline:
 
         log.success(f"Camera: dev={cam.device_id} {cam.width}×{cam.height}@{cam.fps}fps ✓")
 
-        self._pre       = CameraPreprocessor(equalize_hist=False)
+        self._pre       = CameraPreprocessor(
+            equalize_hist = False,
+            use_gaussian  = True,    # Gaussian denoise always on (reduces YOLO FP)
+            use_clahe     = getattr(config.camera, 'use_clahe', False),
+        )
         self._segmentor = InstanceSegmentor(frame_skip=self._frame_skip)
         self._depth_est = create_depth_backend()
         self._mapper    = CoordinateMapper(

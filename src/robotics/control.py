@@ -30,6 +30,13 @@ from src.robotics.kinematics import JointAngles
 from src.utils.config import config
 from src.utils.logger import get_logger
 
+# ── Filter stack: IMU pre-conditioning ──────────────────────────────────
+try:
+    from src.filters.pipeline import SensorFusionPipeline
+    _FUSION_AVAILABLE = True
+except ImportError:
+    _FUSION_AVAILABLE = False
+
 log = get_logger("robotics.control")
 
 MAX_RETRIES   = 3
@@ -94,9 +101,23 @@ class RobotController:
         # Last command actually sent — used for dead-band deduplication
         self._last_sent_angles: Optional[JointAngles] = None
 
-        # ── Stage 2/3: Input shaping & AI resonance estimator ─────────────────
-        self._shaper    = shaper      # plug in a ZVShaper / ZVDShaper / AdaptiveShaper
-        self._estimator = estimator   # plug in a ResonanceEstimator for Stage 3
+        # ── Stage 2/3: Input shaping & AI resonance estimator ──────────────
+        self._shaper    = shaper      # ZVShaper / ZVDShaper / AdaptiveShaper
+        self._estimator = estimator   # ResonanceEstimator (Stage 3)
+
+        # ── IMU signal conditioning (Butterworth LPF + Complementary) ───────
+        # Raw IMU from Arduino serial is filtered BEFORE passing to the EKF
+        # ResonanceEstimator, improving ωₙ/ζ estimation accuracy.
+        if _FUSION_AVAILABLE and estimator is not None:
+            imu_rate = getattr(config, 'input_shaping', None)
+            fs = float(getattr(imu_rate, 'imu_sample_rate', 200.0)) if imu_rate else 200.0
+            self._imu_fusion = SensorFusionPipeline(
+                imu_sample_rate_hz=fs,
+                imu_cutoff_hz=30.0,
+            )
+            log.info(f"IMU SensorFusionPipeline active | fs={fs:.0f}Hz | LPF@30Hz ✓")
+        else:
+            self._imu_fusion = None
 
         if shaper is not None:
             log.info(
@@ -278,11 +299,31 @@ class RobotController:
                 a = resp["angles"]
                 self._current_angles = JointAngles(*a[:5]) if len(a) >= 5 else None
 
-            # ── Stage 3: Forward IMU telemetry to the resonance estimator ─────
+            # ── Stage 3: Forward IMU telemetry to the resonance estimator ────
             if "imu" in resp and self._estimator is not None:
                 try:
                     from src.robotics.ai_estimator import IMUSample
                     imu = IMUSample.from_dict(resp["imu"])
+
+                    # Pre-filter IMU through Butterworth LPF + Complementary
+                    # BEFORE the EKF estimator sees the data
+                    if self._imu_fusion is not None:
+                        self._imu_fusion.update_imu(
+                            ax=imu.ax, ay=imu.ay, az=imu.az,
+                            gx=imu.gx, gy=imu.gy, gz=imu.gz,
+                        )
+                        # Replace raw acc values with filtered magnitude
+                        # (EKF uses acc_magnitude internally)
+                        import math as _math
+                        filtered_mag = self._imu_fusion.acc_magnitude_smooth
+                        # Rebuild IMUSample with smoothed magnitude direction
+                        scale = filtered_mag / max(imu.acc_magnitude, 1e-6)
+                        imu = IMUSample(
+                            timestamp=imu.timestamp,
+                            ax=imu.ax * scale, ay=imu.ay * scale, az=imu.az * scale,
+                            gx=imu.gx, gy=imu.gy, gz=imu.gz,
+                        )
+
                     self._estimator.update(imu)
                 except Exception as _exc:
                     log.debug(f"IMU parse error: {_exc}")
